@@ -1,0 +1,34 @@
+{
+  "name": "speedup-chrome-extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "$npm_execpath --bun node_modules/.bin/wxt",
+    "dev:chrome": "$npm_execpath --bun node_modules/.bin/wxt -b chrome",
+    "build": "$npm_execpath --bun node_modules/.bin/wxt build",
+    "zip": "$npm_execpath --bun node_modules/.bin/wxt zip",
+    "compile": "tsc --noEmit",
+    "lint": "$npm_execpath --bun node_modules/.bin/oxlint . --deny-warnings",
+    "format": "$npm_execpath --bun node_modules/.bin/oxfmt .",
+    "format:check": "$npm_execpath --bun node_modules/.bin/oxfmt --check .",
+    "check": "tsc --noEmit && $npm_execpath --bun node_modules/.bin/oxlint . --deny-warnings && $npm_execpath --bun node_modules/.bin/oxfmt --check .",
+    "postinstall": "$npm_execpath --bun node_modules/.bin/wxt prepare"
+  },
+  "dependencies": {
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.2.0",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@wxt-dev/module-react": "^1.2.2",
+    "oxfmt": "^0.45.0",
+    "oxlint": "^1.62.0",
+    "tailwindcss": "^4.2.0",
+    "typescript": "^5.9.3",
+    "wxt": "^0.20.25"
+  },
+  "packageManager": "bun@1.3.13"
+}

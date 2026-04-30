@@ -1,0 +1,10 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": ["react", "typescript", "import"],
+  "env": {
+    "browser": true,
+    "es2024": true,
+    "webextensions": true
+  },
+  "ignorePatterns": ["node_modules/**", ".wxt/**", ".output/**", "dist/**"]
+}
