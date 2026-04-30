@@ -1,7 +1,6 @@
 import {
   DEFAULT_SPEED_CONFIG,
   effectiveSpeed,
-  formatSpeedLabel,
   normalizeSpeedConfig,
   SPEED_MESSAGE_TYPE,
   SPEED_STATS_MESSAGE_TYPE,
@@ -54,7 +53,7 @@ export default defineUnlistedScript(() => {
 
   const timers = new Map<number, TimerRecord>();
   const animationFrames = new Map<number, number>();
-  const pendingStats = new Map<string, SpeedStatsIncrement>();
+  const pendingStats = new Map<SpeedFunctionName, SpeedStatsIncrement>();
   let statsFlushId: number | undefined;
 
   function getSpeed(): number {
@@ -117,17 +116,14 @@ export default defineUnlistedScript(() => {
       return;
     }
 
-    const speedLabel = formatSpeedLabel(speed);
-    const statsKey = `${functionName}:${speedLabel}`;
-    const increment = pendingStats.get(statsKey);
+    const increment = pendingStats.get(functionName);
 
     if (increment) {
       increment.count += 1;
     } else {
-      pendingStats.set(statsKey, {
+      pendingStats.set(functionName, {
         count: 1,
         functionName,
-        speedLabel,
       });
     }
 

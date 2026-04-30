@@ -1,12 +1,11 @@
 export const SPEED_CONFIG_STORAGE_KEY = "speedup:config";
-export const SPEED_STATS_STORAGE_KEY = "speedup:stats";
 export const SPEED_TAB_STATS_STORAGE_KEY_PREFIX = "speedup:stats:tab";
 
 export const SPEED_MESSAGE_TYPE = "speedup-extension:config";
 export const SPEED_STATS_MESSAGE_TYPE = "speedup-extension:stats";
 
 export const MIN_SPEED = 1;
-export const MAX_SPEED = 16;
+export const MAX_SPEED = 100;
 export const SPEED_STEP = 0.25;
 
 export const SPEED_FUNCTIONS = ["setTimeout", "setInterval", "requestAnimationFrame"] as const;
@@ -19,17 +18,11 @@ export type SpeedConfig = {
 
 export type SpeedFunctionName = (typeof SPEED_FUNCTIONS)[number];
 
-type SpeedFunctionStats = {
-  total: number;
-  bySpeed: Record<string, number>;
-};
-
-export type SpeedTriggerStats = Record<SpeedFunctionName, SpeedFunctionStats>;
+export type SpeedTriggerStats = Record<SpeedFunctionName, number>;
 
 export type SpeedStatsIncrement = {
   count: number;
   functionName: SpeedFunctionName;
-  speedLabel: string;
 };
 
 export const DEFAULT_SPEED_CONFIG: SpeedConfig = {
@@ -70,10 +63,7 @@ export function formatSpeedLabel(speed: number): string {
 
 export function createEmptySpeedTriggerStats(): SpeedTriggerStats {
   return SPEED_FUNCTIONS.reduce((stats, functionName) => {
-    stats[functionName] = {
-      bySpeed: {},
-      total: 0,
-    };
+    stats[functionName] = 0;
     return stats;
   }, {} as SpeedTriggerStats);
 }
@@ -88,23 +78,16 @@ export function normalizeSpeedTriggerStats(value: unknown): SpeedTriggerStats {
   for (const functionName of SPEED_FUNCTIONS) {
     const source = value[functionName];
 
+    if (typeof source === "number") {
+      stats[functionName] = normalizeNonNegativeInteger(source);
+      continue;
+    }
+
     if (!isRecord(source)) {
       continue;
     }
 
-    stats[functionName].total = normalizeNonNegativeInteger(source.total);
-
-    if (!isRecord(source.bySpeed)) {
-      continue;
-    }
-
-    for (const [speedLabel, count] of Object.entries(source.bySpeed)) {
-      const normalizedCount = normalizeNonNegativeInteger(count);
-
-      if (normalizedCount > 0 && isSpeedLabel(speedLabel)) {
-        stats[functionName].bySpeed[speedLabel] = normalizedCount;
-      }
-    }
+    stats[functionName] = normalizeNonNegativeInteger(source.total);
   }
 
   return stats;
@@ -124,16 +107,10 @@ export function normalizeSpeedStatsIncrements(value: unknown): SpeedStatsIncreme
 
     const count = normalizePositiveInteger(increment.count);
 
-    if (
-      count > 0 &&
-      isSpeedFunctionName(increment.functionName) &&
-      typeof increment.speedLabel === "string" &&
-      isSpeedLabel(increment.speedLabel)
-    ) {
+    if (count > 0 && isSpeedFunctionName(increment.functionName)) {
       increments.push({
         count,
         functionName: increment.functionName,
-        speedLabel: increment.speedLabel,
       });
     }
   }
@@ -148,10 +125,7 @@ export function addSpeedStatsIncrements(
   const nextStats = normalizeSpeedTriggerStats(stats);
 
   for (const increment of normalizeSpeedStatsIncrements(increments)) {
-    const functionStats = nextStats[increment.functionName];
-    functionStats.total += increment.count;
-    functionStats.bySpeed[increment.speedLabel] =
-      (functionStats.bySpeed[increment.speedLabel] ?? 0) + increment.count;
+    nextStats[increment.functionName] += increment.count;
   }
 
   return nextStats;
@@ -263,15 +237,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isSpeedFunctionName(value: unknown): value is SpeedFunctionName {
   return typeof value === "string" && SPEED_FUNCTIONS.includes(value as SpeedFunctionName);
-}
-
-function isSpeedLabel(value: string): boolean {
-  if (!/^(?:[1-9]\d*)(?:\.\d{1,2})?x$/.test(value)) {
-    return false;
-  }
-
-  const speed = Number(value.slice(0, -1));
-  return Number.isFinite(speed) && speed > MIN_SPEED && speed <= MAX_SPEED;
 }
 
 function normalizeNonNegativeInteger(value: unknown): number {

@@ -5,7 +5,7 @@ A Chrome extension that speeds up webpage timers and animation frames. It inject
 ## Features
 
 - Toggle speed changes on or off from the popup.
-- Choose a speed from `1x` to `16x` in `0.25x` increments.
+- Choose a speed from `1x` to `100x` in `0.25x` increments.
 - Quick-select common speeds: `1x`, `1.5x`, `2x`, `3x`, `4x`, `8x`, and `16x`.
 - Enter and apply a custom speed value from the popup.
 - Disable speed changes on the current site with a per-host exclusion.

@@ -69,7 +69,9 @@ export default defineBackground(() => {
     const statsStorageKey = getSpeedStatsStorageKey(tabId);
 
     if (statsStorageKey) {
-      void browser.storage.local.remove(statsStorageKey);
+      statsWriteQueue = statsWriteQueue
+        .catch(() => undefined)
+        .then(() => browser.storage.local.remove(statsStorageKey));
     }
   });
 });

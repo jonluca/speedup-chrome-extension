@@ -7,15 +7,16 @@ import {
   DEFAULT_SPEED_CONFIG,
   formatSpeedLabel,
   getHostnameFromUrl,
+  getSpeedStatsStorageKey,
   isHostnameExcluded,
   MAX_SPEED,
   MIN_SPEED,
+  normalizeTabId,
   normalizeSpeedConfig,
   normalizeSpeedTriggerStats,
   setHostnameExcluded,
   SPEED_CONFIG_STORAGE_KEY,
   SPEED_FUNCTIONS,
-  SPEED_STATS_STORAGE_KEY,
   SPEED_STEP,
   type SpeedConfig,
   type SpeedTriggerStats,
@@ -27,14 +28,17 @@ const buttonInteractiveClass =
   "cursor-pointer rounded-lg border transition-colors focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
 const neutralButtonClass = `${buttonInteractiveClass} border-slate-300 bg-white text-slate-800 hover:border-blue-300 hover:bg-[#f8fbff]`;
 const quickSpeedButtonClass = `${neutralButtonClass} min-h-[34px]`;
-const customSpeedInputClass =
-  "min-h-[34px] min-w-0 rounded-lg border border-slate-300 bg-white px-2 text-center text-slate-800 focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
+const customSpeedInputBaseClass =
+  "min-h-[34px] min-w-0 rounded-lg border px-2 text-center focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
+const customSpeedInputClass = `${customSpeedInputBaseClass} border-slate-300 bg-white text-slate-800`;
+const selectedCustomSpeedInputClass = `${customSpeedInputBaseClass} border-blue-600 bg-blue-600 text-white`;
 const selectedSpeedButtonClass = `${buttonInteractiveClass} min-h-[34px] border-blue-600 bg-blue-600 text-white hover:border-blue-600 hover:bg-blue-600`;
 
 export default function App() {
   const [config, setConfig] = useState<SpeedConfig>(DEFAULT_SPEED_CONFIG);
   const [customSpeed, setCustomSpeed] = useState(() => DEFAULT_SPEED_CONFIG.speed.toString());
   const [currentHost, setCurrentHost] = useState<string>();
+  const [currentTabId, setCurrentTabId] = useState<number>();
   const [stats, setStats] = useState<SpeedTriggerStats>(() => createEmptySpeedTriggerStats());
   const [isLoaded, setIsLoaded] = useState(false);
 
@@ -42,15 +46,19 @@ export default function App() {
     let cancelled = false;
 
     async function loadConfig() {
-      const [stored, tabs] = await Promise.all([
-        browser.storage.local.get([SPEED_CONFIG_STORAGE_KEY, SPEED_STATS_STORAGE_KEY]),
-        browser.tabs.query({ active: true, currentWindow: true }).catch(() => []),
-      ]);
+      const tabs = await browser.tabs.query({ active: true, currentWindow: true }).catch(() => []);
+      const activeTab = tabs[0];
+      const tabId = normalizeTabId(activeTab?.id);
+      const statsStorageKey = getSpeedStatsStorageKey(tabId);
+      const stored = await browser.storage.local.get(
+        statsStorageKey ? [SPEED_CONFIG_STORAGE_KEY, statsStorageKey] : SPEED_CONFIG_STORAGE_KEY,
+      );
 
       if (!cancelled) {
         setConfig(normalizeSpeedConfig(stored[SPEED_CONFIG_STORAGE_KEY]));
-        setCurrentHost(getHostnameFromUrl(tabs[0]?.url));
-        setStats(normalizeSpeedTriggerStats(stored[SPEED_STATS_STORAGE_KEY]));
+        setCurrentHost(getHostnameFromUrl(activeTab?.url));
+        setCurrentTabId(tabId);
+        setStats(normalizeSpeedTriggerStats(statsStorageKey ? stored[statsStorageKey] : undefined));
         setIsLoaded(true);
       }
     }
@@ -76,7 +84,8 @@ export default function App() {
       }
 
       const configChange = changes[SPEED_CONFIG_STORAGE_KEY];
-      const statsChange = changes[SPEED_STATS_STORAGE_KEY];
+      const statsStorageKey = getSpeedStatsStorageKey(currentTabId);
+      const statsChange = statsStorageKey ? changes[statsStorageKey] : undefined;
 
       if (configChange) {
         setConfig(normalizeSpeedConfig(configChange.newValue));
@@ -92,7 +101,7 @@ export default function App() {
     return () => {
       browser.storage.onChanged.removeListener(handleStorageChange);
     };
-  }, []);
+  }, [currentTabId]);
 
   async function saveConfig(nextConfig: SpeedConfig) {
     const normalized = normalizeSpeedConfig(nextConfig);
@@ -121,10 +130,16 @@ export default function App() {
   }
 
   async function resetStats() {
+    const statsStorageKey = getSpeedStatsStorageKey(currentTabId);
+
+    if (!statsStorageKey) {
+      return;
+    }
+
     const emptyStats = createEmptySpeedTriggerStats();
     setStats(emptyStats);
     await browser.storage.local.set({
-      [SPEED_STATS_STORAGE_KEY]: emptyStats,
+      [statsStorageKey]: emptyStats,
     });
   }
 
@@ -133,6 +148,7 @@ export default function App() {
     [config, currentHost],
   );
   const showSpeedControls = !isCurrentSiteExcluded;
+  const isCustomSpeedSelected = !QUICK_SPEEDS.includes(config.speed);
 
   const statusText = useMemo(() => {
     if (!config.enabled) {
@@ -149,16 +165,9 @@ export default function App() {
   const statsRows = useMemo(
     () =>
       SPEED_FUNCTIONS.map((functionName) => {
-        const functionStats = stats[functionName];
-        const breakdown = Object.entries(functionStats.bySpeed)
-          .sort(([speedA], [speedB]) => Number.parseFloat(speedA) - Number.parseFloat(speedB))
-          .map(([speedLabel, count]) => `${speedLabel}: ${numberFormatter.format(count)}`)
-          .join(" | ");
-
         return {
-          breakdown,
           functionName,
-          total: functionStats.total,
+          total: stats[functionName],
         };
       }),
     [stats],
@@ -256,7 +265,9 @@ export default function App() {
             ))}
             <input
               aria-label="Custom speed"
-              className={customSpeedInputClass}
+              className={
+                isCustomSpeedSelected ? selectedCustomSpeedInputClass : customSpeedInputClass
+              }
               disabled={!isLoaded}
               id="customSpeed"
               max={MAX_SPEED}
@@ -294,12 +305,12 @@ export default function App() {
                   Speed-up calls
                 </h2>
                 <p className="mb-0 mt-0.5 text-[11px] text-slate-500">
-                  {numberFormatter.format(totalTriggers)} total
+                  {numberFormatter.format(totalTriggers)} this tab
                 </p>
               </div>
               <button
                 className={`${neutralButtonClass} min-h-[30px] px-2.5 text-xs font-[650]`}
-                disabled={!isLoaded || totalTriggers === 0}
+                disabled={!isLoaded || currentTabId == null || totalTriggers === 0}
                 type="button"
                 onClick={() => void resetStats()}
               >
@@ -316,9 +327,6 @@ export default function App() {
                   <div className="min-w-0">
                     <span className="block font-mono text-xs font-[650] text-slate-800">
                       {row.functionName}
-                    </span>
-                    <span className="block overflow-hidden text-ellipsis whitespace-nowrap text-[11px] text-slate-500">
-                      {row.breakdown || "No calls yet"}
                     </span>
                   </div>
                   <strong className="shrink-0 text-lg leading-none text-blue-700">
