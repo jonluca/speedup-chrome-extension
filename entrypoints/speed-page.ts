@@ -23,6 +23,7 @@ const STATS_FLUSH_DELAY_MS = 1000;
 type TimerRecord = {
   active: boolean;
   delay: number;
+  functionName: "setInterval" | "setTimeout";
   handler: TimeoutHandler;
   nativeId: number;
   publicId: number;
@@ -31,6 +32,8 @@ type TimerRecord = {
   type: "interval" | "timeout";
   args: TimerArgs;
 };
+
+type SpeedFunctionSpeeds = Record<SpeedFunctionName, number>;
 
 export default defineUnlistedScript(() => {
   const originalSetTimeout = window.setTimeout.bind(window);
@@ -56,12 +59,23 @@ export default defineUnlistedScript(() => {
   const pendingStats = new Map<SpeedFunctionName, SpeedStatsIncrement>();
   let statsFlushId: number | undefined;
 
-  function getSpeed(): number {
-    return Math.max(1, effectiveSpeed(config, window.location.hostname));
+  function getSpeed(functionName: SpeedFunctionName): number {
+    return Math.max(1, effectiveSpeed(config, window.location.hostname, functionName));
   }
 
-  function virtualNow(realNow = originalPerformanceNow()): number {
-    return virtualClockBase + (realNow - realClockBase) * getSpeed();
+  function getCurrentSpeeds(): SpeedFunctionSpeeds {
+    return {
+      requestAnimationFrame: getSpeed("requestAnimationFrame"),
+      setInterval: getSpeed("setInterval"),
+      setTimeout: getSpeed("setTimeout"),
+    };
+  }
+
+  function virtualNow(
+    realNow = originalPerformanceNow(),
+    speed = getSpeed("requestAnimationFrame"),
+  ): number {
+    return virtualClockBase + (realNow - realClockBase) * speed;
   }
 
   function normalizeDelay(delay?: number): number {
@@ -74,12 +88,12 @@ export default defineUnlistedScript(() => {
     return parsed;
   }
 
-  function getNativeDelay(virtualDelay: number): number {
+  function getNativeDelay(virtualDelay: number, functionName: SpeedFunctionName): number {
     if (virtualDelay <= 0) {
       return 0;
     }
 
-    return virtualDelay / getSpeed();
+    return virtualDelay / getSpeed(functionName);
   }
 
   function flushSpeedStats(): void {
@@ -110,7 +124,7 @@ export default defineUnlistedScript(() => {
   }
 
   function logSpeedTrigger(functionName: SpeedFunctionName): void {
-    const speed = getSpeed();
+    const speed = getSpeed(functionName);
 
     if (speed <= 1) {
       return;
@@ -157,7 +171,7 @@ export default defineUnlistedScript(() => {
         record.remainingVirtualMs = record.delay;
         scheduleTimer(record);
       }
-    }, getNativeDelay(record.remainingVirtualMs));
+    }, getNativeDelay(record.remainingVirtualMs, record.functionName));
   }
 
   function clearManagedTimer(publicId?: unknown): boolean {
@@ -177,12 +191,16 @@ export default defineUnlistedScript(() => {
     return true;
   }
 
-  function rescheduleTimersForSpeedChange(now: number, previousSpeed: number): void {
+  function rescheduleTimersForSpeedChange(
+    now: number,
+    previousSpeeds: SpeedFunctionSpeeds,
+  ): void {
     for (const record of timers.values()) {
       if (!record.active) {
         continue;
       }
 
+      const previousSpeed = previousSpeeds[record.functionName];
       const elapsedVirtualMs = (now - record.startedAt) * previousSpeed;
       record.remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
 
@@ -193,15 +211,19 @@ export default defineUnlistedScript(() => {
 
   function updateConfig(nextConfig: unknown): void {
     const now = originalPerformanceNow();
-    const previousSpeed = getSpeed();
+    const previousSpeeds = getCurrentSpeeds();
 
-    virtualClockBase = virtualNow(now);
+    virtualClockBase = virtualNow(now, previousSpeeds.requestAnimationFrame);
     realClockBase = now;
     config = normalizeSpeedConfig(nextConfig);
-    rescheduleTimersForSpeedChange(now, previousSpeed);
+    rescheduleTimersForSpeedChange(now, previousSpeeds);
   }
 
   function managedSetTimeout(handler: TimeoutHandler, delay?: number, ...args: TimerArgs): number {
+    if (getSpeed("setTimeout") <= 1) {
+      return originalSetTimeout(handler, delay, ...args);
+    }
+
     const normalizedDelay = normalizeDelay(delay);
 
     if (normalizedDelay > 0) {
@@ -212,6 +234,7 @@ export default defineUnlistedScript(() => {
       active: true,
       args,
       delay: normalizedDelay,
+      functionName: "setTimeout",
       handler,
       nativeId: 0,
       publicId: 0,
@@ -228,6 +251,10 @@ export default defineUnlistedScript(() => {
   }
 
   function managedSetInterval(handler: TimeoutHandler, delay?: number, ...args: TimerArgs): number {
+    if (getSpeed("setInterval") <= 1) {
+      return originalSetInterval(handler, delay, ...args);
+    }
+
     const normalizedDelay = normalizeDelay(delay);
 
     if (normalizedDelay > 0) {
@@ -238,6 +265,7 @@ export default defineUnlistedScript(() => {
       active: true,
       args,
       delay: normalizedDelay,
+      functionName: "setInterval",
       handler,
       nativeId: 0,
       publicId: 0,
@@ -266,6 +294,10 @@ export default defineUnlistedScript(() => {
   }
 
   function managedRequestAnimationFrame(callback: FrameRequestCallback): number {
+    if (getSpeed("requestAnimationFrame") <= 1) {
+      return originalRequestAnimationFrame(callback);
+    }
+
     const nativeId = originalRequestAnimationFrame((timestamp) => {
       animationFrames.delete(nativeId);
       callback(virtualNow(timestamp));

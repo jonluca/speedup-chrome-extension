@@ -19,11 +19,17 @@ import {
   SPEED_FUNCTIONS,
   SPEED_STEP,
   type SpeedConfig,
+  type SpeedFunctionName,
   type SpeedTriggerStats,
 } from "../../utils/speed-config";
 
 const QUICK_SPEEDS = [1, 1.5, 2, 3, 4, 8, 16];
 const numberFormatter = new Intl.NumberFormat();
+const FUNCTION_TYPE_DESCRIPTIONS: Record<SpeedFunctionName, string> = {
+  requestAnimationFrame: "Animation frame callbacks",
+  setInterval: "Repeating timers",
+  setTimeout: "One-shot timers",
+};
 const buttonInteractiveClass =
   "cursor-pointer rounded-lg border transition-colors focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
 const neutralButtonClass = `${buttonInteractiveClass} border-slate-300 bg-white text-slate-800 hover:border-blue-300 hover:bg-[#f8fbff]`;
@@ -119,6 +125,16 @@ export default function App() {
     await saveConfig(setHostnameExcluded(config, currentHost, excluded));
   }
 
+  async function saveFunctionEnabled(functionName: SpeedFunctionName, enabled: boolean) {
+    await saveConfig({
+      ...config,
+      enabledFunctions: {
+        ...config.enabledFunctions,
+        [functionName]: enabled,
+      },
+    });
+  }
+
   async function saveCustomSpeed() {
     const speed = clampSpeed(customSpeed);
     setCustomSpeed(speed.toString());
@@ -147,6 +163,10 @@ export default function App() {
     () => isHostnameExcluded(config, currentHost),
     [config, currentHost],
   );
+  const enabledFunctionCount = useMemo(
+    () => SPEED_FUNCTIONS.filter((functionName) => config.enabledFunctions[functionName]).length,
+    [config.enabledFunctions],
+  );
   const showSpeedControls = !isCurrentSiteExcluded;
   const isCustomSpeedSelected = !QUICK_SPEEDS.includes(config.speed);
 
@@ -159,8 +179,12 @@ export default function App() {
       return "Site paused";
     }
 
+    if (enabledFunctionCount === 0) {
+      return "All off";
+    }
+
     return formatSpeedLabel(config.speed);
-  }, [config.enabled, config.speed, isCurrentSiteExcluded]);
+  }, [config.enabled, config.speed, enabledFunctionCount, isCurrentSiteExcluded]);
 
   const statsRows = useMemo(
     () =>
@@ -294,50 +318,71 @@ export default function App() {
           >
             Reset to normal speed
           </button>
-
-          <section
-            className="flex flex-col gap-2.5 border-t border-slate-200 pt-3.5"
-            aria-label="Speed-up trigger counts"
-          >
-            <div className="flex items-center justify-between gap-3">
-              <div>
-                <h2 className="m-0 text-[13px] font-[720] leading-tight text-slate-900">
-                  Speed-up calls
-                </h2>
-                <p className="mb-0 mt-0.5 text-[11px] text-slate-500">
-                  {numberFormatter.format(totalTriggers)} this tab
-                </p>
-              </div>
-              <button
-                className={`${neutralButtonClass} min-h-[30px] px-2.5 text-xs font-[650]`}
-                disabled={!isLoaded || currentTabId == null || totalTriggers === 0}
-                type="button"
-                onClick={() => void resetStats()}
-              >
-                Clear
-              </button>
-            </div>
-
-            <ul className="m-0 flex list-none flex-col gap-2 p-0">
-              {statsRows.map((row) => (
-                <li
-                  className="flex min-h-11 items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-2.5 py-2"
-                  key={row.functionName}
-                >
-                  <div className="min-w-0">
-                    <span className="block font-mono text-xs font-[650] text-slate-800">
-                      {row.functionName}
-                    </span>
-                  </div>
-                  <strong className="shrink-0 text-lg leading-none text-blue-700">
-                    {numberFormatter.format(row.total)}
-                  </strong>
-                </li>
-              ))}
-            </ul>
-          </section>
         </>
       ) : null}
+
+      <section
+        className="flex flex-col gap-2.5 border-t border-slate-200 pt-3.5"
+        aria-label="Speed-up function types and trigger counts"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h2 className="m-0 text-[13px] font-[720] leading-tight text-slate-900">
+              Speed-up calls
+            </h2>
+            <p className="mb-0 mt-0.5 text-[11px] text-slate-500">
+              {enabledFunctionCount} of {SPEED_FUNCTIONS.length} enabled,{" "}
+              {numberFormatter.format(totalTriggers)} this tab
+            </p>
+          </div>
+          <button
+            className={`${neutralButtonClass} min-h-[30px] px-2.5 text-xs font-[650]`}
+            disabled={!isLoaded || currentTabId == null || totalTriggers === 0}
+            type="button"
+            onClick={() => void resetStats()}
+          >
+            Clear
+          </button>
+        </div>
+
+        <ul className="m-0 flex list-none flex-col gap-2 p-0">
+          {statsRows.map((row) => (
+            <li
+              className="grid min-h-[54px] grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-2 rounded-lg border border-slate-200 bg-white px-2.5 py-2"
+              key={row.functionName}
+            >
+              <div className="min-w-0">
+                <span className="block font-mono text-xs font-[650] text-slate-800">
+                  {row.functionName}
+                </span>
+                <span className="block truncate text-[11px] text-slate-500">
+                  {FUNCTION_TYPE_DESCRIPTIONS[row.functionName]}
+                </span>
+              </div>
+              <strong className="min-w-8 shrink-0 text-right text-lg leading-none text-blue-700 tabular-nums">
+                {numberFormatter.format(row.total)}
+              </strong>
+              <label
+                aria-label={`Enable ${row.functionName}`}
+                className="relative inline-flex h-[26px] w-[46px] shrink-0 cursor-pointer"
+                title={`Enable ${row.functionName}`}
+              >
+                <input
+                  className="peer sr-only"
+                  checked={config.enabledFunctions[row.functionName]}
+                  disabled={!isLoaded}
+                  type="checkbox"
+                  onChange={(event) =>
+                    void saveFunctionEnabled(row.functionName, event.currentTarget.checked)
+                  }
+                />
+                <span className="h-full w-full rounded-full bg-slate-300 transition-colors duration-150 peer-checked:bg-blue-600 peer-focus-visible:ring-[3px] peer-focus-visible:ring-blue-600/25 peer-disabled:cursor-not-allowed peer-disabled:opacity-[0.55]" />
+                <span className="pointer-events-none absolute left-[3px] top-[3px] h-5 w-5 rounded-full bg-white shadow-[0_1px_2px_rgb(15_23_42_/_22%)] transition-transform duration-150 peer-checked:translate-x-5 peer-disabled:opacity-[0.55]" />
+              </label>
+            </li>
+          ))}
+        </ul>
+      </section>
     </main>
   );
 }

@@ -10,13 +10,16 @@ export const SPEED_STEP = 0.25;
 
 export const SPEED_FUNCTIONS = ["setTimeout", "setInterval", "requestAnimationFrame"] as const;
 
+export type SpeedFunctionName = (typeof SPEED_FUNCTIONS)[number];
+
+export type SpeedFunctionSettings = Record<SpeedFunctionName, boolean>;
+
 export type SpeedConfig = {
   enabled: boolean;
+  enabledFunctions: SpeedFunctionSettings;
   excludedHosts: string[];
   speed: number;
 };
-
-export type SpeedFunctionName = (typeof SPEED_FUNCTIONS)[number];
 
 export type SpeedTriggerStats = Record<SpeedFunctionName, number>;
 
@@ -27,6 +30,7 @@ export type SpeedStatsIncrement = {
 
 export const DEFAULT_SPEED_CONFIG: SpeedConfig = {
   enabled: true,
+  enabledFunctions: createDefaultSpeedFunctionSettings(),
   excludedHosts: [],
   speed: 2,
 };
@@ -47,13 +51,22 @@ export function normalizeSpeedConfig(value: unknown): SpeedConfig {
 
   return {
     enabled: typeof config.enabled === "boolean" ? config.enabled : true,
+    enabledFunctions: normalizeSpeedFunctionSettings(config.enabledFunctions),
     excludedHosts: normalizeExcludedHosts(config.excludedHosts),
     speed: clampSpeed(config.speed),
   };
 }
 
-export function effectiveSpeed(config: SpeedConfig, hostname?: unknown): number {
-  return config.enabled && !isHostnameExcluded(config, hostname) ? config.speed : 1;
+export function effectiveSpeed(
+  config: SpeedConfig,
+  hostname?: unknown,
+  functionName?: SpeedFunctionName,
+): number {
+  return config.enabled &&
+    !isHostnameExcluded(config, hostname) &&
+    (functionName == null || isSpeedFunctionEnabled(config, functionName))
+    ? config.speed
+    : 1;
 }
 
 export function formatSpeedLabel(speed: number): string {
@@ -66,6 +79,38 @@ export function createEmptySpeedTriggerStats(): SpeedTriggerStats {
     stats[functionName] = 0;
     return stats;
   }, {} as SpeedTriggerStats);
+}
+
+export function createDefaultSpeedFunctionSettings(): SpeedFunctionSettings {
+  return SPEED_FUNCTIONS.reduce((settings, functionName) => {
+    settings[functionName] = functionName !== "requestAnimationFrame";
+    return settings;
+  }, {} as SpeedFunctionSettings);
+}
+
+export function normalizeSpeedFunctionSettings(value: unknown): SpeedFunctionSettings {
+  const settings = createDefaultSpeedFunctionSettings();
+
+  if (!isRecord(value)) {
+    return settings;
+  }
+
+  for (const functionName of SPEED_FUNCTIONS) {
+    const enabled = value[functionName];
+
+    if (typeof enabled === "boolean") {
+      settings[functionName] = enabled;
+    }
+  }
+
+  return settings;
+}
+
+export function isSpeedFunctionEnabled(
+  config: SpeedConfig,
+  functionName: SpeedFunctionName,
+): boolean {
+  return config.enabledFunctions[functionName];
 }
 
 export function normalizeSpeedTriggerStats(value: unknown): SpeedTriggerStats {

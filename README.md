@@ -9,6 +9,7 @@ A Chrome extension that speeds up webpage timers and animation frames. It inject
 - Quick-select common speeds: `1x`, `1.5x`, `2x`, `3x`, `4x`, `8x`, and `16x`.
 - Enter and apply a custom speed value from the popup.
 - Disable speed changes on the current site with a per-host exclusion.
+- Enable or disable speed changes for each wrapped function type.
 - Applies changes to all frames on matching pages.
 - Persists settings in extension local storage.
 
@@ -24,6 +25,7 @@ The content script runs at `document_start` and injects `speed-page.js` into the
 - `cancelAnimationFrame`
 
 When the popup updates the speed setting, the content script forwards the new config to the page script so active timers can be rescheduled against the new multiplier.
+Each wrapped function type can be toggled independently from the popup's call tracking section.
 
 This does not speed up network requests, media playback, CSS animations, or browser-native work that does not rely on the wrapped JavaScript timer APIs.
 
