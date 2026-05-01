@@ -20,6 +20,7 @@ import {
   SPEED_STEP,
   type SpeedConfig,
   type SpeedFunctionName,
+  type SpeedMode,
   type SpeedTriggerStats,
 } from "../../utils/speed-config";
 
@@ -39,6 +40,8 @@ const customSpeedInputBaseClass =
 const customSpeedInputClass = `${customSpeedInputBaseClass} border-slate-300 bg-white text-slate-800`;
 const selectedCustomSpeedInputClass = `${customSpeedInputBaseClass} border-blue-600 bg-blue-600 text-white`;
 const selectedSpeedButtonClass = `${buttonInteractiveClass} min-h-[34px] border-blue-600 bg-blue-600 text-white hover:border-blue-600 hover:bg-blue-600`;
+const modeButtonClass = `${buttonInteractiveClass} min-h-[32px] border-slate-300 bg-white px-2 text-sm font-[650] text-slate-700 hover:border-blue-300 hover:bg-[#f8fbff]`;
+const selectedModeButtonClass = `${buttonInteractiveClass} min-h-[32px] border-blue-600 bg-blue-600 px-2 text-sm font-[650] text-white hover:border-blue-600 hover:bg-blue-600`;
 
 export default function App() {
   const [config, setConfig] = useState<SpeedConfig>(DEFAULT_SPEED_CONFIG);
@@ -135,6 +138,33 @@ export default function App() {
     });
   }
 
+  async function saveMode(mode: SpeedMode) {
+    await saveConfig({
+      ...config,
+      enabled: true,
+      mode,
+    });
+  }
+
+  async function openManualSidebar() {
+    void saveMode("manual");
+
+    if (currentTabId == null) {
+      return;
+    }
+
+    await browser.sidePanel.open({ tabId: currentTabId });
+  }
+
+  async function selectMode(mode: SpeedMode) {
+    if (mode === "manual") {
+      await openManualSidebar();
+      return;
+    }
+
+    await saveMode(mode);
+  }
+
   async function saveCustomSpeed() {
     const speed = clampSpeed(customSpeed);
     setCustomSpeed(speed.toString());
@@ -183,8 +213,12 @@ export default function App() {
       return "All off";
     }
 
+    if (config.mode === "manual") {
+      return "Manual";
+    }
+
     return formatSpeedLabel(config.speed);
-  }, [config.enabled, config.speed, enabledFunctionCount, isCurrentSiteExcluded]);
+  }, [config.enabled, config.mode, config.speed, enabledFunctionCount, isCurrentSiteExcluded]);
 
   const statsRows = useMemo(
     () =>
@@ -236,6 +270,20 @@ export default function App() {
         aria-live="polite"
       >
         <span className="text-[38px] font-[760] leading-none text-blue-700">{statusText}</span>
+      </section>
+
+      <section className="grid grid-cols-2 gap-2" aria-label="Speed mode">
+        {(["automatic", "manual"] as const).map((mode) => (
+          <button
+            className={config.mode === mode ? selectedModeButtonClass : modeButtonClass}
+            disabled={!isLoaded}
+            key={mode}
+            type="button"
+            onClick={() => void selectMode(mode)}
+          >
+            {mode === "automatic" ? "Automatic" : "Manual"}
+          </button>
+        ))}
       </section>
 
       <section
@@ -317,6 +365,15 @@ export default function App() {
             onClick={() => void saveConfig({ ...config, enabled: true, speed: 1 })}
           >
             Reset to normal speed
+          </button>
+
+          <button
+            className={`${neutralButtonClass} min-h-[34px] w-full font-[650]`}
+            disabled={!isLoaded || currentTabId == null}
+            type="button"
+            onClick={() => void openManualSidebar()}
+          >
+            Open manual sidebar
           </button>
         </>
       ) : null}

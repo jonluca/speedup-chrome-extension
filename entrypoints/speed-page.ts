@@ -1,9 +1,16 @@
 import {
   DEFAULT_SPEED_CONFIG,
   effectiveSpeed,
+  isHostnameExcluded,
+  isSpeedFunctionEnabled,
   normalizeSpeedConfig,
+  SPEED_CALLS_CHANGED_MESSAGE_TYPE,
+  SPEED_CALLS_COMMAND_MESSAGE_TYPE,
+  SPEED_CALLS_REFRESH_MESSAGE_TYPE,
   SPEED_MESSAGE_TYPE,
   SPEED_STATS_MESSAGE_TYPE,
+  type SpeedCallFunctionName,
+  type SpeedCallSnapshot,
   type SpeedConfig,
   type SpeedFunctionName,
   type SpeedStatsIncrement,
@@ -19,15 +26,20 @@ type TimeoutHandler = string | ((...args: unknown[]) => void);
 type TimerArgs = unknown[];
 
 const STATS_FLUSH_DELAY_MS = 1000;
+const CALLS_FLUSH_DELAY_MS = 100;
 
 type TimerRecord = {
   active: boolean;
+  addedAt: number;
+  callId: string;
   delay: number;
-  functionName: "setInterval" | "setTimeout";
+  functionName: SpeedCallFunctionName;
   handler: TimeoutHandler;
+  handlerLabel: string;
   nativeId: number;
   publicId: number;
   remainingVirtualMs: number;
+  scheduledSpeed: number;
   startedAt: number;
   type: "interval" | "timeout";
   args: TimerArgs;
@@ -53,11 +65,15 @@ export default defineUnlistedScript(() => {
   let config: SpeedConfig = DEFAULT_SPEED_CONFIG;
   let virtualClockBase = originalPerformanceNow();
   let realClockBase = virtualClockBase;
+  let nextCallSequence = 1;
 
   const timers = new Map<number, TimerRecord>();
+  const timerCallIds = new Map<string, TimerRecord>();
   const animationFrames = new Map<number, number>();
   const pendingStats = new Map<SpeedFunctionName, SpeedStatsIncrement>();
   let statsFlushId: number | undefined;
+  let callsFlushId: number | undefined;
+  const pageSessionId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 
   function getSpeed(functionName: SpeedFunctionName): number {
     return Math.max(1, effectiveSpeed(config, window.location.hostname, functionName));
@@ -69,6 +85,34 @@ export default defineUnlistedScript(() => {
       setInterval: getSpeed("setInterval"),
       setTimeout: getSpeed("setTimeout"),
     };
+  }
+
+  function isSpeedChangeAllowed(functionName: SpeedFunctionName): boolean {
+    return (
+      config.enabled &&
+      !isHostnameExcluded(config, window.location.hostname) &&
+      isSpeedFunctionEnabled(config, functionName)
+    );
+  }
+
+  function shouldManageTimer(functionName: SpeedCallFunctionName): boolean {
+    if (!isSpeedChangeAllowed(functionName)) {
+      return false;
+    }
+
+    return config.mode === "manual" || config.speed > 1;
+  }
+
+  function getTimerSpeed(record: TimerRecord): number {
+    if (!isSpeedChangeAllowed(record.functionName)) {
+      return 1;
+    }
+
+    if (config.mode === "manual") {
+      return 1;
+    }
+
+    return config.speed;
   }
 
   function virtualNow(
@@ -88,12 +132,26 @@ export default defineUnlistedScript(() => {
     return parsed;
   }
 
-  function getNativeDelay(virtualDelay: number, functionName: SpeedFunctionName): number {
+  function createCallId(): string {
+    const callId = `${pageSessionId}:${nextCallSequence}`;
+    nextCallSequence += 1;
+    return callId;
+  }
+
+  function getHandlerLabel(handler: TimeoutHandler): string {
+    if (typeof handler === "string") {
+      return "string handler";
+    }
+
+    return handler.name ? `${handler.name}()` : "anonymous handler";
+  }
+
+  function getNativeDelay(virtualDelay: number, speed: number): number {
     if (virtualDelay <= 0) {
       return 0;
     }
 
-    return virtualDelay / getSpeed(functionName);
+    return virtualDelay / Math.max(1, speed);
   }
 
   function flushSpeedStats(): void {
@@ -123,10 +181,64 @@ export default defineUnlistedScript(() => {
     statsFlushId = originalSetTimeout(flushSpeedStats, STATS_FLUSH_DELAY_MS);
   }
 
-  function logSpeedTrigger(functionName: SpeedFunctionName): void {
-    const speed = getSpeed(functionName);
+  function getTimerRemainingMs(record: TimerRecord, now = originalPerformanceNow()): number {
+    const elapsedVirtualMs = (now - record.startedAt) * record.scheduledSpeed;
+    const remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
+    return getNativeDelay(remainingVirtualMs, record.scheduledSpeed);
+  }
 
-    if (speed <= 1) {
+  function getTimerSnapshot(
+    record: TimerRecord,
+    now = originalPerformanceNow(),
+  ): SpeedCallSnapshot {
+    const remainingMs = getTimerRemainingMs(record, now);
+
+    return {
+      addedAt: record.addedAt,
+      delay: record.delay,
+      dueAt: Date.now() + remainingMs,
+      functionName: record.functionName,
+      handlerLabel: record.handlerLabel,
+      id: record.callId,
+      publicId: record.publicId,
+      remainingMs,
+      speed: record.scheduledSpeed,
+      type: record.type,
+      url: window.location.href,
+    };
+  }
+
+  function flushSpeedCalls(): void {
+    callsFlushId = undefined;
+
+    const now = originalPerformanceNow();
+    const calls = Array.from(timers.values())
+      .filter((record) => record.active)
+      .map((record) => getTimerSnapshot(record, now));
+
+    window.postMessage(
+      {
+        calls,
+        capturedAt: Date.now(),
+        type: SPEED_CALLS_CHANGED_MESSAGE_TYPE,
+      },
+      "*",
+    );
+  }
+
+  function scheduleCallsFlush(): void {
+    if (callsFlushId != null) {
+      return;
+    }
+
+    callsFlushId = originalSetTimeout(flushSpeedCalls, CALLS_FLUSH_DELAY_MS);
+  }
+
+  function logSpeedTrigger(
+    functionName: SpeedFunctionName,
+    shouldLog = getSpeed(functionName) > 1,
+  ): void {
+    if (!shouldLog) {
       return;
     }
 
@@ -153,25 +265,41 @@ export default defineUnlistedScript(() => {
     (0, eval)(handler);
   }
 
-  function scheduleTimer(record: TimerRecord): void {
+  function completeTimerOccurrence(record: TimerRecord): void {
+    if (!record.active) {
+      return;
+    }
+
+    if (record.type === "timeout") {
+      timers.delete(record.publicId);
+      timerCallIds.delete(record.callId);
+      record.active = false;
+      scheduleCallsFlush();
+    }
+
+    invokeTimerHandler(record.handler, record.args);
+
+    if (record.type === "interval" && record.active) {
+      record.remainingVirtualMs = record.delay;
+      scheduleTimer(record);
+    }
+  }
+
+  function scheduleTimer(record: TimerRecord, notify = true): void {
+    const speed = getTimerSpeed(record);
+
+    record.scheduledSpeed = speed;
     record.startedAt = originalPerformanceNow();
-    record.nativeId = originalSetTimeout(() => {
-      if (!record.active) {
-        return;
-      }
+    record.nativeId = originalSetTimeout(
+      () => {
+        completeTimerOccurrence(record);
+      },
+      getNativeDelay(record.remainingVirtualMs, speed),
+    );
 
-      if (record.type === "timeout") {
-        timers.delete(record.publicId);
-        record.active = false;
-      }
-
-      invokeTimerHandler(record.handler, record.args);
-
-      if (record.type === "interval" && record.active) {
-        record.remainingVirtualMs = record.delay;
-        scheduleTimer(record);
-      }
-    }, getNativeDelay(record.remainingVirtualMs, record.functionName));
+    if (notify) {
+      scheduleCallsFlush();
+    }
   }
 
   function clearManagedTimer(publicId?: unknown): boolean {
@@ -187,26 +315,55 @@ export default defineUnlistedScript(() => {
 
     record.active = false;
     timers.delete(publicId);
+    timerCallIds.delete(record.callId);
     originalClearTimeout(record.nativeId);
+    scheduleCallsFlush();
     return true;
   }
 
-  function rescheduleTimersForSpeedChange(
-    now: number,
-    previousSpeeds: SpeedFunctionSpeeds,
-  ): void {
+  function rescheduleTimer(record: TimerRecord, now = originalPerformanceNow()): void {
+    const elapsedVirtualMs = (now - record.startedAt) * record.scheduledSpeed;
+    record.remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
+
+    originalClearTimeout(record.nativeId);
+    scheduleTimer(record);
+  }
+
+  function rescheduleTimersForSpeedChange(now: number): void {
     for (const record of timers.values()) {
       if (!record.active) {
         continue;
       }
 
-      const previousSpeed = previousSpeeds[record.functionName];
-      const elapsedVirtualMs = (now - record.startedAt) * previousSpeed;
-      record.remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
-
-      originalClearTimeout(record.nativeId);
-      scheduleTimer(record);
+      rescheduleTimer(record, now);
     }
+  }
+
+  function invokeCallNow(callId: unknown): void {
+    if (typeof callId !== "string") {
+      return;
+    }
+
+    const record = timerCallIds.get(callId);
+
+    if (
+      !record ||
+      !record.active ||
+      config.mode !== "manual" ||
+      !isSpeedChangeAllowed(record.functionName)
+    ) {
+      flushSpeedCalls();
+      return;
+    }
+
+    originalClearTimeout(record.nativeId);
+
+    if (record.delay > 0) {
+      logSpeedTrigger(record.functionName, true);
+    }
+
+    completeTimerOccurrence(record);
+    flushSpeedCalls();
   }
 
   function updateConfig(nextConfig: unknown): void {
@@ -216,67 +373,80 @@ export default defineUnlistedScript(() => {
     virtualClockBase = virtualNow(now, previousSpeeds.requestAnimationFrame);
     realClockBase = now;
     config = normalizeSpeedConfig(nextConfig);
-    rescheduleTimersForSpeedChange(now, previousSpeeds);
+    rescheduleTimersForSpeedChange(now);
+    scheduleCallsFlush();
   }
 
   function managedSetTimeout(handler: TimeoutHandler, delay?: number, ...args: TimerArgs): number {
-    if (getSpeed("setTimeout") <= 1) {
+    if (!shouldManageTimer("setTimeout")) {
       return originalSetTimeout(handler, delay, ...args);
     }
 
     const normalizedDelay = normalizeDelay(delay);
 
-    if (normalizedDelay > 0) {
-      logSpeedTrigger("setTimeout");
-    }
-
     const record: TimerRecord = {
       active: true,
+      addedAt: Date.now(),
       args,
+      callId: createCallId(),
       delay: normalizedDelay,
       functionName: "setTimeout",
       handler,
+      handlerLabel: getHandlerLabel(handler),
       nativeId: 0,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
+      scheduledSpeed: 1,
       startedAt: 0,
       type: "timeout",
     };
 
-    scheduleTimer(record);
+    if (normalizedDelay > 0 && getTimerSpeed(record) > 1) {
+      logSpeedTrigger("setTimeout");
+    }
+
+    scheduleTimer(record, false);
     record.publicId = record.nativeId;
     timers.set(record.publicId, record);
+    timerCallIds.set(record.callId, record);
+    scheduleCallsFlush();
 
     return record.publicId;
   }
 
   function managedSetInterval(handler: TimeoutHandler, delay?: number, ...args: TimerArgs): number {
-    if (getSpeed("setInterval") <= 1) {
+    if (!shouldManageTimer("setInterval")) {
       return originalSetInterval(handler, delay, ...args);
     }
 
     const normalizedDelay = normalizeDelay(delay);
 
-    if (normalizedDelay > 0) {
-      logSpeedTrigger("setInterval");
-    }
-
     const record: TimerRecord = {
       active: true,
+      addedAt: Date.now(),
       args,
+      callId: createCallId(),
       delay: normalizedDelay,
       functionName: "setInterval",
       handler,
+      handlerLabel: getHandlerLabel(handler),
       nativeId: 0,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
+      scheduledSpeed: 1,
       startedAt: 0,
       type: "interval",
     };
 
-    scheduleTimer(record);
+    if (normalizedDelay > 0 && getTimerSpeed(record) > 1) {
+      logSpeedTrigger("setInterval");
+    }
+
+    scheduleTimer(record, false);
     record.publicId = record.nativeId;
     timers.set(record.publicId, record);
+    timerCallIds.set(record.callId, record);
+    scheduleCallsFlush();
 
     return record.publicId;
   }
@@ -347,12 +517,27 @@ export default defineUnlistedScript(() => {
   window.cancelAnimationFrame = managedCancelAnimationFrame as typeof window.cancelAnimationFrame;
 
   window.addEventListener("message", (event: MessageEvent) => {
-    if (event.source !== window || event.data?.type !== SPEED_MESSAGE_TYPE) {
+    if (event.source !== window) {
       return;
     }
 
-    updateConfig(event.data.config);
+    if (event.data?.type === SPEED_MESSAGE_TYPE) {
+      updateConfig(event.data.config);
+      return;
+    }
+
+    if (event.data?.type === SPEED_CALLS_REFRESH_MESSAGE_TYPE) {
+      flushSpeedCalls();
+      return;
+    }
+
+    if (event.data?.type === SPEED_CALLS_COMMAND_MESSAGE_TYPE) {
+      invokeCallNow(event.data.callId);
+    }
   });
 
-  window.addEventListener("pagehide", flushSpeedStats);
+  window.addEventListener("pagehide", () => {
+    flushSpeedStats();
+    flushSpeedCalls();
+  });
 });

@@ -4,8 +4,12 @@ import { injectScript } from "wxt/utils/inject-script";
 import {
   DEFAULT_SPEED_CONFIG,
   isHostnameExcluded,
+  normalizeSpeedCallSnapshots,
   normalizeSpeedConfig,
   normalizeSpeedStatsIncrements,
+  SPEED_CALLS_CHANGED_MESSAGE_TYPE,
+  SPEED_CALLS_COMMAND_MESSAGE_TYPE,
+  SPEED_CALLS_REFRESH_MESSAGE_TYPE,
   SPEED_CONFIG_STORAGE_KEY,
   SPEED_MESSAGE_TYPE,
   SPEED_STATS_MESSAGE_TYPE,
@@ -85,26 +89,51 @@ export default defineContentScript({
     }
 
     window.addEventListener("message", (event: MessageEvent) => {
-      if (
-        event.source !== window ||
-        event.data?.type !== SPEED_STATS_MESSAGE_TYPE ||
-        !ctx.isValid
-      ) {
+      if (event.source !== window || !ctx.isValid) {
         return;
       }
 
-      const increments = normalizeSpeedStatsIncrements(event.data.increments);
+      if (event.data?.type === SPEED_STATS_MESSAGE_TYPE) {
+        const increments = normalizeSpeedStatsIncrements(event.data.increments);
 
-      if (increments.length === 0) {
+        if (increments.length === 0) {
+          return;
+        }
+
+        void browser.runtime
+          .sendMessage({
+            increments,
+            type: SPEED_STATS_MESSAGE_TYPE,
+          })
+          .catch(() => undefined);
         return;
       }
 
-      void browser.runtime
-        .sendMessage({
-          increments,
-          type: SPEED_STATS_MESSAGE_TYPE,
-        })
-        .catch(() => undefined);
+      if (event.data?.type === SPEED_CALLS_CHANGED_MESSAGE_TYPE) {
+        void browser.runtime
+          .sendMessage({
+            calls: normalizeSpeedCallSnapshots(event.data.calls),
+            capturedAt: event.data.capturedAt,
+            frameUrl: window.location.href,
+            type: SPEED_CALLS_CHANGED_MESSAGE_TYPE,
+          })
+          .catch(() => undefined);
+      }
+    });
+
+    browser.runtime.onMessage.addListener((message: unknown) => {
+      if (!ctx.isValid || message == null || typeof message !== "object") {
+        return;
+      }
+
+      const type = (message as { type?: unknown }).type;
+
+      if (type !== SPEED_CALLS_COMMAND_MESSAGE_TYPE && type !== SPEED_CALLS_REFRESH_MESSAGE_TYPE) {
+        return;
+      }
+
+      window.postMessage(message, "*");
+      return Promise.resolve({ ok: true });
     });
 
     browser.storage.onChanged.addListener((changes, areaName) => {

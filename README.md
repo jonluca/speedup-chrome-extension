@@ -10,6 +10,10 @@ A Chrome extension that speeds up webpage timers and animation frames. It inject
 - Enter and apply a custom speed value from the popup.
 - Disable speed changes on the current site with a per-host exclusion.
 - Enable or disable speed changes for each wrapped function type.
+- Switch between automatic mode and manual mode.
+- Open a native Chrome side panel for manual mode.
+- In manual mode, view active `setTimeout` and `setInterval` calls and invoke individual calls immediately.
+- Sort manual calls by longest remaining duration or newest addition.
 - Applies changes to all frames on matching pages.
 - Persists settings in extension local storage.
 
@@ -27,7 +31,12 @@ The content script runs at `document_start` and injects `speed-page.js` into the
 When the popup updates the speed setting, the content script forwards the new config to the page script so active timers can be rescheduled against the new multiplier.
 Each wrapped function type can be toggled independently from the popup's call tracking section.
 
+Automatic mode keeps the previous behavior: enabled timer and animation frame APIs run at the configured multiplier.
+Manual mode tracks active timeout and interval calls at normal speed until you invoke a call from the Chrome side panel.
+The side panel receives live timer snapshots through the background service worker and sends invoke-now commands back to the frame that owns the selected call.
+
 This does not speed up network requests, media playback, CSS animations, or browser-native work that does not rely on the wrapped JavaScript timer APIs.
+Manual selection applies to `setTimeout` and `setInterval` calls created while the page script is managing timers; it does not expose already-created native timers from before manual mode was enabled.
 
 ## Requirements
 
@@ -102,6 +111,7 @@ entrypoints/
   speed.content.ts     Injects the page script and forwards config changes.
   speed-page.ts        Wraps page timer and animation frame APIs.
   popup/               React popup UI for speed controls.
+  sidepanel/           React side panel UI for manual per-call invocation.
 utils/
   speed-config.ts      Shared speed config constants and normalization helpers.
 wxt.config.ts          WXT and extension manifest configuration.
