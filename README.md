@@ -14,6 +14,8 @@ A Chrome extension that speeds up webpage timers and animation frames. It inject
 - Open a native Chrome side panel for manual mode.
 - In manual mode, view active `setTimeout` and `setInterval` calls and invoke individual calls immediately.
 - Sort manual calls by longest remaining duration or newest addition.
+- Hide manual timer call sources permanently by stack location.
+- Disable individual manual timer calls or block future calls from the same source location.
 - Applies changes to all frames on matching pages.
 - Persists settings in extension local storage.
 
@@ -34,6 +36,8 @@ Each wrapped function type can be toggled independently from the popup's call tr
 Automatic mode keeps the previous behavior: enabled timer and animation frame APIs run at the configured multiplier.
 Manual mode tracks active timeout and interval calls at normal speed until you invoke a call from the Chrome side panel.
 The side panel receives live timer snapshots through the background service worker and sends invoke-now commands back to the frame that owns the selected call.
+The side panel can also hide timer sources by the first non-extension stack location, so newly registered timers from a hidden source stay hidden until you show hidden sources again.
+Disabling a source stores that source location and forwards it to page scripts so matching active timers are canceled and future matching registrations are suppressed.
 
 This does not speed up network requests, media playback, CSS animations, or browser-native work that does not rely on the wrapped JavaScript timer APIs.
 Manual selection applies to `setTimeout` and `setInterval` calls created while the page script is managing timers; it does not expose already-created native timers from before manual mode was enabled.

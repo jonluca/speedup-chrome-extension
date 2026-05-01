@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Virtuoso } from "react-virtuoso";
 import { browser } from "wxt/browser";
 
 import {
@@ -9,6 +10,8 @@ import {
   isHostnameExcluded,
   MAX_SPEED,
   MIN_SPEED,
+  normalizeHiddenCallSourceKeys,
+  normalizeSpeedCallSources,
   normalizeSpeedCallPanelItems,
   normalizeSpeedConfig,
   normalizeTabId,
@@ -16,8 +19,12 @@ import {
   SPEED_CALLS_COMMAND_MESSAGE_TYPE,
   SPEED_CALLS_LIST_MESSAGE_TYPE,
   SPEED_CONFIG_STORAGE_KEY,
+  SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY,
+  SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY,
   SPEED_STEP,
+  type SpeedCallCommand,
   type SpeedCallPanelItem,
+  type SpeedCallSource,
   type SpeedConfig,
   type SpeedMode,
 } from "../../utils/speed-config";
@@ -28,14 +35,33 @@ const buttonInteractiveClass =
   "cursor-pointer rounded-lg border transition-colors focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
 const neutralButtonClass = `${buttonInteractiveClass} border-slate-300 bg-white text-slate-800 hover:border-blue-300 hover:bg-[#f8fbff]`;
 const selectedButtonClass = `${buttonInteractiveClass} border-blue-600 bg-blue-600 text-white hover:border-blue-600 hover:bg-blue-600`;
+const dangerButtonClass = `${buttonInteractiveClass} border-red-200 bg-white text-red-700 hover:border-red-300 hover:bg-red-50`;
 const speedButtonClass = `${neutralButtonClass} min-h-[34px]`;
 const selectedSpeedButtonClass = `${selectedButtonClass} min-h-[34px]`;
 const customSpeedInputBaseClass =
   "min-h-[34px] min-w-0 rounded-lg border px-2 text-center focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
 const customSpeedInputClass = `${customSpeedInputBaseClass} border-slate-300 bg-white text-slate-800`;
 const selectedCustomSpeedInputClass = `${customSpeedInputBaseClass} border-blue-600 bg-blue-600 text-white`;
+const CALL_ROW_RETENTION_MS = 1500;
+const TIMER_TICK_MS = 250;
 
 type SortMode = "duration" | "recent";
+
+type DisplayedSpeedCallPanelItem = SpeedCallPanelItem & {
+  displayKey: string;
+  isLive: boolean;
+  lastSeenAt: number;
+};
+
+type TimedSpeedCallPanelItem = DisplayedSpeedCallPanelItem & {
+  ageMs: number;
+  remainingMs: number;
+};
+
+type RetainedCallRecord = {
+  call: SpeedCallPanelItem;
+  lastSeenAt: number;
+};
 
 type ActiveTab = {
   id?: number;
@@ -81,8 +107,227 @@ function normalizeActiveTab(tab: unknown): ActiveTab {
   };
 }
 
-function getCallViewKey(call: Pick<SpeedCallPanelItem, "frameId" | "id" | "tabId">): string {
-  return `${call.tabId}:${call.frameId}:${call.id}`;
+function getCallSourceKey(call: Pick<SpeedCallPanelItem, "sourceKey">): string {
+  return call.sourceKey;
+}
+
+function getCallRetentionKey(
+  call: Pick<SpeedCallPanelItem, "frameId" | "sourceKey" | "tabId">,
+): string {
+  return `${call.tabId}:${call.frameId}:${call.sourceKey}`;
+}
+
+function sortTimedCalls(
+  calls: TimedSpeedCallPanelItem[],
+  sortMode: SortMode,
+): TimedSpeedCallPanelItem[] {
+  return calls.toSorted((left, right) => {
+    if (sortMode === "recent") {
+      return right.lastSeenAt - left.lastSeenAt || right.addedAt - left.addedAt;
+    }
+
+    return right.remainingMs - left.remainingMs;
+  });
+}
+
+function getRepresentativeCall(
+  left: SpeedCallPanelItem | undefined,
+  right: SpeedCallPanelItem,
+): SpeedCallPanelItem {
+  if (!left || right.addedAt > left.addedAt || right.dueAt > left.dueAt) {
+    return right;
+  }
+
+  return left;
+}
+
+function pruneRetainedCalls(
+  retainedCalls: Map<string, RetainedCallRecord>,
+  now: number,
+  activeTabId?: number,
+): Map<string, RetainedCallRecord> {
+  let changed = false;
+  const next = new Map<string, RetainedCallRecord>();
+
+  for (const [key, record] of retainedCalls) {
+    const isCurrentTab = activeTabId == null || record.call.tabId === activeTabId;
+    const isFresh = now - record.lastSeenAt <= CALL_ROW_RETENTION_MS;
+
+    if (isCurrentTab && isFresh) {
+      next.set(key, record);
+      continue;
+    }
+
+    changed = true;
+  }
+
+  return changed ? next : retainedCalls;
+}
+
+type CallCardProps = {
+  call: TimedSpeedCallPanelItem;
+  config: SpeedConfig;
+  isLoaded: boolean;
+  onDisable: (call: SpeedCallPanelItem) => void;
+  onDisableSource: (call: SpeedCallPanelItem) => void;
+  onInvoke: (call: SpeedCallPanelItem) => void;
+  onShowSource?: (call: SpeedCallPanelItem) => void;
+};
+
+function CallCard({
+  call,
+  config,
+  isLoaded,
+  onDisable,
+  onDisableSource,
+  onInvoke,
+  onShowSource,
+}: CallCardProps) {
+  const callHost = getHostnameFromUrl(call.url);
+  const isCallSpeedAllowed =
+    config.enabled &&
+    config.enabledFunctions[call.functionName] &&
+    !isHostnameExcluded(config, callHost);
+  const isCallRunningFast = call.speed > MIN_SPEED;
+  const canDisableSource = isLoaded && config.mode === "manual" && isCallSpeedAllowed;
+  const canToggleCall = call.isLive && canDisableSource;
+  const statusLabel = call.isLive
+    ? isCallRunningFast
+      ? formatSpeedLabel(call.speed)
+      : "normal"
+    : "recent";
+
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <span className="block font-mono text-xs font-[720] text-slate-900">
+            {call.functionName}
+          </span>
+          <span className="block truncate text-[11px] text-slate-500">
+            {call.handlerLabel}
+            {callHost ? `, ${callHost}` : ""}
+          </span>
+          <span
+            className="block truncate font-mono text-[10px] text-slate-400"
+            title={call.sourceLabel}
+          >
+            {call.sourceLabel}
+          </span>
+        </div>
+        <span
+          className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-[720] ${
+            call.isLive && isCallRunningFast
+              ? "bg-blue-100 text-blue-700"
+              : "bg-slate-100 text-slate-600"
+          }`}
+        >
+          {statusLabel}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-500">
+        <span>
+          <strong className="block text-xs text-slate-900">
+            {formatDuration(call.remainingMs)}
+          </strong>
+          remaining
+        </span>
+        <span>
+          <strong className="block text-xs text-slate-900">{formatDuration(call.delay)}</strong>
+          delay
+        </span>
+        <span>
+          <strong className="block text-xs text-slate-900">{formatDuration(call.ageMs)}</strong>
+          added ago
+        </span>
+      </div>
+
+      <div className="grid gap-2">
+        {onShowSource ? (
+          <button
+            className={`${neutralButtonClass} min-h-[32px] px-2 text-sm font-[650]`}
+            disabled={!isLoaded}
+            type="button"
+            onClick={() => onShowSource(call)}
+          >
+            Unhide source
+          </button>
+        ) : null}
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            className={`${dangerButtonClass} min-h-[32px] px-2 text-sm font-[650]`}
+            disabled={!canToggleCall}
+            type="button"
+            onClick={() => onDisable(call)}
+          >
+            Disable once
+          </button>
+          <button
+            className={`${dangerButtonClass} min-h-[32px] px-2 text-sm font-[650]`}
+            disabled={!canDisableSource}
+            type="button"
+            onClick={() => onDisableSource(call)}
+          >
+            Disable source
+          </button>
+        </div>
+        <div>
+          <button
+            className={`${selectedButtonClass} min-h-[32px] w-full px-2 text-sm font-[650]`}
+            disabled={!canToggleCall}
+            type="button"
+            onClick={() => onInvoke(call)}
+          >
+            {call.isLive ? "Invoke now" : "Waiting"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type CallListProps = {
+  calls: TimedSpeedCallPanelItem[];
+  config: SpeedConfig;
+  isLoaded: boolean;
+  onDisable: (call: SpeedCallPanelItem) => void;
+  onDisableSource: (call: SpeedCallPanelItem) => void;
+  onInvoke: (call: SpeedCallPanelItem) => void;
+  onShowSource?: (call: SpeedCallPanelItem) => void;
+};
+
+function CallList({
+  calls,
+  config,
+  isLoaded,
+  onDisable,
+  onDisableSource,
+  onInvoke,
+  onShowSource,
+}: CallListProps) {
+  return (
+    <Virtuoso
+      className="call-list overflow-x-hidden"
+      computeItemKey={(_, call) => call.displayKey}
+      data={calls}
+      increaseViewportBy={300}
+      itemContent={(_, call) => (
+        <div className="pb-2">
+          <CallCard
+            call={call}
+            config={config}
+            isLoaded={isLoaded}
+            onDisable={onDisable}
+            onDisableSource={onDisableSource}
+            onInvoke={onInvoke}
+            onShowSource={onShowSource}
+          />
+        </div>
+      )}
+      useWindowScroll
+    />
+  );
 }
 
 export default function App() {
@@ -90,14 +335,24 @@ export default function App() {
   const [calls, setCalls] = useState<SpeedCallPanelItem[]>([]);
   const [config, setConfig] = useState<SpeedConfig>(DEFAULT_SPEED_CONFIG);
   const [customSpeed, setCustomSpeed] = useState(() => DEFAULT_SPEED_CONFIG.speed.toString());
-  const [hiddenCallKeys, setHiddenCallKeys] = useState<Set<string>>(() => new Set());
+  const [disabledSources, setDisabledSources] = useState<SpeedCallSource[]>(() => []);
+  const [areDisabledSourcesExpanded, setAreDisabledSourcesExpanded] = useState(false);
+  const [hiddenSourceKeys, setHiddenSourceKeys] = useState<Set<string>>(() => new Set());
+  const [areHiddenCallsExpanded, setAreHiddenCallsExpanded] = useState(false);
   const [isLoaded, setIsLoaded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
+  const [retainedCalls, setRetainedCalls] = useState<Map<string, RetainedCallRecord>>(
+    () => new Map(),
+  );
   const [sortMode, setSortMode] = useState<SortMode>("duration");
 
   const loadPanelState = useCallback(async (requestedTabId?: number) => {
     const [stored, response] = await Promise.all([
-      browser.storage.local.get(SPEED_CONFIG_STORAGE_KEY),
+      browser.storage.local.get([
+        SPEED_CONFIG_STORAGE_KEY,
+        SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY,
+        SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY,
+      ]),
       browser.runtime
         .sendMessage({
           tabId: requestedTabId,
@@ -112,6 +367,10 @@ export default function App() {
     setActiveTab(tab);
     setCalls(normalizeSpeedCallPanelItems(panelResponse.calls));
     setConfig(normalizeSpeedConfig(stored[SPEED_CONFIG_STORAGE_KEY]));
+    setDisabledSources(normalizeSpeedCallSources(stored[SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY]));
+    setHiddenSourceKeys(
+      new Set(normalizeHiddenCallSourceKeys(stored[SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY])),
+    );
     setIsLoaded(true);
   }, []);
 
@@ -124,9 +383,38 @@ export default function App() {
   }, [config.speed]);
 
   useEffect(() => {
-    const tickId = window.setInterval(() => setNow(Date.now()), 500);
+    const tickId = window.setInterval(() => setNow(Date.now()), TIMER_TICK_MS);
     return () => window.clearInterval(tickId);
   }, []);
+
+  useEffect(() => {
+    setRetainedCalls((current) => {
+      const receivedAt = Date.now();
+      const next = new Map(pruneRetainedCalls(current, receivedAt, activeTab.id));
+      const representativeCalls = new Map<string, SpeedCallPanelItem>();
+
+      for (const call of calls) {
+        const retentionKey = getCallRetentionKey(call);
+        representativeCalls.set(
+          retentionKey,
+          getRepresentativeCall(representativeCalls.get(retentionKey), call),
+        );
+      }
+
+      for (const [retentionKey, call] of representativeCalls) {
+        next.set(retentionKey, {
+          call,
+          lastSeenAt: receivedAt,
+        });
+      }
+
+      return next;
+    });
+  }, [activeTab.id, calls]);
+
+  useEffect(() => {
+    setRetainedCalls((current) => pruneRetainedCalls(current, now, activeTab.id));
+  }, [activeTab.id, now]);
 
   useEffect(() => {
     const handleStorageChange = (
@@ -141,6 +429,18 @@ export default function App() {
 
       if (configChange) {
         setConfig(normalizeSpeedConfig(configChange.newValue));
+      }
+
+      const disabledSourcesChange = changes[SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY];
+
+      if (disabledSourcesChange) {
+        setDisabledSources(normalizeSpeedCallSources(disabledSourcesChange.newValue));
+      }
+
+      const hiddenSourcesChange = changes[SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY];
+
+      if (hiddenSourcesChange) {
+        setHiddenSourceKeys(new Set(normalizeHiddenCallSourceKeys(hiddenSourcesChange.newValue)));
       }
     };
 
@@ -198,30 +498,6 @@ export default function App() {
     };
   }, [activeTab.id, loadPanelState]);
 
-  useEffect(() => {
-    setHiddenCallKeys((current) => {
-      if (activeTab.id == null || current.size === 0) {
-        return current;
-      }
-
-      const activeTabPrefix = `${activeTab.id}:`;
-      const activeTabCallKeys = new Set(calls.map(getCallViewKey));
-      let changed = false;
-      const next = new Set<string>();
-
-      for (const key of current) {
-        if (!key.startsWith(activeTabPrefix) || activeTabCallKeys.has(key)) {
-          next.add(key);
-          continue;
-        }
-
-        changed = true;
-      }
-
-      return changed ? next : current;
-    });
-  }, [activeTab.id, calls]);
-
   async function saveConfig(nextConfig: SpeedConfig) {
     const normalized = normalizeSpeedConfig(nextConfig);
     setConfig(normalized);
@@ -248,15 +524,116 @@ export default function App() {
     });
   }
 
-  async function sendCallCommand(call: SpeedCallPanelItem) {
+  async function sendCallCommand(call: SpeedCallPanelItem, command: SpeedCallCommand) {
     await browser.runtime
       .sendMessage({
         callId: call.id,
+        command,
         frameId: call.frameId,
+        sourceKey: call.sourceKey,
         tabId: call.tabId,
         type: SPEED_CALLS_COMMAND_MESSAGE_TYPE,
       })
       .catch(() => undefined);
+  }
+
+  function removeRetainedCall(call: SpeedCallPanelItem) {
+    const retentionKey = getCallRetentionKey(call);
+
+    setRetainedCalls((current) => {
+      if (!current.has(retentionKey)) {
+        return current;
+      }
+
+      const next = new Map(current);
+      next.delete(retentionKey);
+      return next;
+    });
+  }
+
+  function removeActiveCall(call: SpeedCallPanelItem) {
+    setCalls((current) =>
+      current.filter(
+        (currentCall) =>
+          currentCall.id !== call.id ||
+          currentCall.frameId !== call.frameId ||
+          currentCall.tabId !== call.tabId,
+      ),
+    );
+    removeRetainedCall(call);
+  }
+
+  function removeActiveCallSource(sourceKey: string) {
+    setCalls((current) => current.filter((currentCall) => currentCall.sourceKey !== sourceKey));
+    setRetainedCalls((current) => {
+      let changed = false;
+      const next = new Map<string, RetainedCallRecord>();
+
+      for (const [retentionKey, record] of current) {
+        if (record.call.sourceKey === sourceKey) {
+          changed = true;
+          continue;
+        }
+
+        next.set(retentionKey, record);
+      }
+
+      return changed ? next : current;
+    });
+  }
+
+  function invokeCall(call: SpeedCallPanelItem) {
+    void sendCallCommand(call, "invoke");
+  }
+
+  function disableCall(call: SpeedCallPanelItem) {
+    removeActiveCall(call);
+    void sendCallCommand(call, "disable");
+  }
+
+  async function saveDisabledSources(sources: SpeedCallSource[]) {
+    await browser.storage.local.set({
+      [SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY]: sources,
+    });
+  }
+
+  function disableCallSource(call: SpeedCallPanelItem) {
+    const source: SpeedCallSource = {
+      key: call.sourceKey,
+      label: call.sourceLabel,
+    };
+    const sourcesByKey = new Map(
+      disabledSources.map((disabledSource) => [disabledSource.key, disabledSource]),
+    );
+
+    sourcesByKey.set(source.key, source);
+
+    const nextSources = Array.from(sourcesByKey.values()).sort((left, right) =>
+      left.label.localeCompare(right.label),
+    );
+
+    setDisabledSources(nextSources);
+    removeActiveCallSource(source.key);
+    void saveDisabledSources(nextSources);
+    void sendCallCommand(call, "disable-source");
+  }
+
+  function enableDisabledSource(sourceKey: string) {
+    const nextSources = disabledSources.filter((source) => source.key !== sourceKey);
+
+    setDisabledSources(nextSources);
+    void saveDisabledSources(nextSources);
+  }
+
+  function clearDisabledSources() {
+    setDisabledSources([]);
+    void saveDisabledSources([]);
+  }
+
+  async function saveHiddenSourceKeys(sourceKeys: Set<string>) {
+    await browser.storage.local.set({
+      [SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY]: Array.from(sourceKeys).sort(),
+    });
   }
 
   function hideVisibleCalls() {
@@ -264,61 +641,136 @@ export default function App() {
       return;
     }
 
-    setHiddenCallKeys((current) => {
-      const next = new Set(current);
+    const next = new Set(hiddenSourceKeys);
 
-      for (const call of sortedCalls) {
-        next.add(getCallViewKey(call));
+    for (const call of sortedCalls) {
+      next.add(getCallSourceKey(call));
+    }
+
+    setHiddenSourceKeys(next);
+    void saveHiddenSourceKeys(next);
+  }
+
+  function showHiddenCalls() {
+    const displayedHiddenSourceKeys = new Set(hiddenCalls.map(getCallSourceKey));
+    const next = new Set<string>();
+
+    for (const key of hiddenSourceKeys) {
+      if (!displayedHiddenSourceKeys.has(key)) {
+        next.add(key);
       }
+    }
 
-      return next;
-    });
+    setHiddenSourceKeys(next);
+    void saveHiddenSourceKeys(next);
+  }
+
+  function showHiddenCallSource(call: SpeedCallPanelItem) {
+    const sourceKey = getCallSourceKey(call);
+
+    if (!hiddenSourceKeys.has(sourceKey)) {
+      return;
+    }
+
+    const next = new Set(hiddenSourceKeys);
+    next.delete(sourceKey);
+    setHiddenSourceKeys(next);
+    void saveHiddenSourceKeys(next);
   }
 
   const hostname = getHostnameFromUrl(activeTab.url);
   const isCustomSpeedSelected = !QUICK_SPEEDS.includes(config.speed);
+  const disabledSourceKeys = useMemo(() => {
+    return new Set(disabledSources.map((source) => source.key));
+  }, [disabledSources]);
+  const displayCalls = useMemo<DisplayedSpeedCallPanelItem[]>(() => {
+    const activeCallsByRetentionKey = new Map<string, SpeedCallPanelItem[]>();
+
+    for (const call of calls) {
+      const retentionKey = getCallRetentionKey(call);
+      const retentionCalls = activeCallsByRetentionKey.get(retentionKey);
+
+      if (retentionCalls) {
+        retentionCalls.push(call);
+      } else {
+        activeCallsByRetentionKey.set(retentionKey, [call]);
+      }
+    }
+
+    const displayItems: DisplayedSpeedCallPanelItem[] = [];
+
+    for (const [retentionKey, retentionCalls] of activeCallsByRetentionKey) {
+      const useSourceDisplayKey = retentionCalls.length === 1;
+      const retainedCall = retainedCalls.get(retentionKey);
+
+      for (const call of retentionCalls) {
+        displayItems.push({
+          ...call,
+          displayKey: useSourceDisplayKey ? retentionKey : `${retentionKey}:${call.id}`,
+          isLive: true,
+          lastSeenAt: retainedCall?.lastSeenAt ?? call.addedAt,
+        });
+      }
+    }
+
+    for (const [retentionKey, record] of retainedCalls) {
+      if (activeCallsByRetentionKey.has(retentionKey)) {
+        continue;
+      }
+
+      displayItems.push({
+        ...record.call,
+        displayKey: retentionKey,
+        isLive: false,
+        lastSeenAt: record.lastSeenAt,
+      });
+    }
+
+    return displayItems;
+  }, [calls, retainedCalls]);
+
   const callsWithTiming = useMemo(() => {
-    return calls.map((call) => ({
+    return displayCalls.map((call) => ({
       ...call,
       ageMs: Math.max(0, now - call.addedAt),
       remainingMs: Math.max(0, call.dueAt - now),
     }));
-  }, [calls, now]);
+  }, [displayCalls, now]);
 
   const visibleCalls = useMemo(() => {
-    return callsWithTiming.filter((call) => !hiddenCallKeys.has(getCallViewKey(call)));
-  }, [callsWithTiming, hiddenCallKeys]);
+    return callsWithTiming.filter(
+      (call) =>
+        !disabledSourceKeys.has(getCallSourceKey(call)) &&
+        !hiddenSourceKeys.has(getCallSourceKey(call)),
+    );
+  }, [callsWithTiming, disabledSourceKeys, hiddenSourceKeys]);
+
+  const hiddenCalls = useMemo(() => {
+    return callsWithTiming.filter(
+      (call) =>
+        !disabledSourceKeys.has(getCallSourceKey(call)) &&
+        hiddenSourceKeys.has(getCallSourceKey(call)),
+    );
+  }, [callsWithTiming, disabledSourceKeys, hiddenSourceKeys]);
 
   const sortedCalls = useMemo(() => {
-    const rows = [...visibleCalls];
-
-    return rows.sort((left, right) => {
-      if (sortMode === "recent") {
-        return right.addedAt - left.addedAt;
-      }
-
-      return right.remainingMs - left.remainingMs;
-    });
+    return sortTimedCalls(visibleCalls, sortMode);
   }, [sortMode, visibleCalls]);
-  const hiddenCallCount = calls.length - visibleCalls.length;
+
+  const sortedHiddenCalls = useMemo(() => {
+    return sortTimedCalls(hiddenCalls, sortMode);
+  }, [hiddenCalls, sortMode]);
+  const hiddenCallCount = hiddenCalls.length;
 
   return (
     <main className="flex min-h-screen flex-col gap-3.5 bg-slate-50 p-4 text-slate-900">
-      <header className="flex items-start justify-between gap-3">
+      <header>
         <div className="min-w-0">
           <h1 className="m-0 text-lg font-[760] leading-tight">Manual Speed Up</h1>
           <p className="mb-0 mt-[3px] truncate text-xs text-slate-500">
             {hostname ?? activeTab.title ?? "Active tab"}
           </p>
         </div>
-        <button
-          className={`${neutralButtonClass} min-h-[30px] px-2.5 text-xs font-[650]`}
-          disabled={!isLoaded}
-          type="button"
-          onClick={() => void loadPanelState(activeTab.id)}
-        >
-          Refresh
-        </button>
       </header>
 
       <section className="grid grid-cols-2 gap-2" aria-label="Speed mode">
@@ -396,7 +848,7 @@ export default function App() {
                 : `${numberFormatter.format(sortedCalls.length)} timer calls in this tab`}
             </p>
           </div>
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <button
               className={`${neutralButtonClass} min-h-[30px] px-2 text-xs font-[650]`}
               disabled={!isLoaded || sortedCalls.length === 0}
@@ -433,82 +885,127 @@ export default function App() {
         </div>
 
         {sortedCalls.length > 0 ? (
-          <ul className="m-0 flex list-none flex-col gap-2 p-0">
-            {sortedCalls.map((call) => {
-              const callHost = getHostnameFromUrl(call.url);
-              const isCallSpeedAllowed =
-                config.enabled &&
-                config.enabledFunctions[call.functionName] &&
-                !isHostnameExcluded(config, callHost);
-              const isCallRunningFast = call.speed > MIN_SPEED;
-              const canToggle = isLoaded && config.mode === "manual" && isCallSpeedAllowed;
-
-              return (
-                <li
-                  className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-3"
-                  key={`${call.tabId}:${call.frameId}:${call.id}`}
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      <span className="block font-mono text-xs font-[720] text-slate-900">
-                        {call.functionName}
-                      </span>
-                      <span className="block truncate text-[11px] text-slate-500">
-                        {call.handlerLabel}
-                        {callHost ? `, ${callHost}` : ""}
-                      </span>
-                    </div>
-                    <span
-                      className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-[720] ${
-                        isCallRunningFast
-                          ? "bg-blue-100 text-blue-700"
-                          : "bg-slate-100 text-slate-600"
-                      }`}
-                    >
-                      {isCallRunningFast ? formatSpeedLabel(call.speed) : "normal"}
-                    </span>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-500">
-                    <span>
-                      <strong className="block text-xs text-slate-900">
-                        {formatDuration(call.remainingMs)}
-                      </strong>
-                      remaining
-                    </span>
-                    <span>
-                      <strong className="block text-xs text-slate-900">
-                        {formatDuration(call.delay)}
-                      </strong>
-                      delay
-                    </span>
-                    <span>
-                      <strong className="block text-xs text-slate-900">
-                        {formatDuration(call.ageMs)}
-                      </strong>
-                      added ago
-                    </span>
-                  </div>
-
-                  <button
-                    className={`${selectedButtonClass} min-h-[32px] w-full px-2 text-sm font-[650]`}
-                    disabled={!canToggle}
-                    type="button"
-                    onClick={() => void sendCallCommand(call)}
-                  >
-                    Invoke now
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+          <CallList
+            calls={sortedCalls}
+            config={config}
+            isLoaded={isLoaded}
+            onDisable={disableCall}
+            onDisableSource={disableCallSource}
+            onInvoke={invokeCall}
+          />
         ) : (
           <div className="rounded-lg border border-dashed border-slate-300 bg-white px-3 py-8 text-center text-sm text-slate-500">
-            {calls.length > 0
-              ? "All active timer calls are hidden. New timeout and interval calls will appear here."
+            {displayCalls.length > 0
+              ? "All active timer sources are hidden. Calls from hidden locations stay hidden until you show them again."
               : "No active timer calls for this tab. Manual mode tracks new timeout and interval calls as pages create them."}
           </div>
         )}
+
+        {hiddenCallCount > 0 ? (
+          <div className="flex flex-col gap-2 border-t border-slate-200 pt-2.5">
+            <button
+              aria-controls="hidden-calls-panel"
+              aria-expanded={areHiddenCallsExpanded}
+              className={`${neutralButtonClass} flex min-h-[42px] w-full items-center justify-between gap-3 px-3 py-2 text-left`}
+              disabled={!isLoaded}
+              type="button"
+              onClick={() => setAreHiddenCallsExpanded((isExpanded) => !isExpanded)}
+            >
+              <span className="min-w-0">
+                <span className="block text-xs font-[720] text-slate-900">Hidden calls</span>
+                <span className="block text-[11px] text-slate-500">
+                  {numberFormatter.format(hiddenCallCount)} hidden timer{" "}
+                  {hiddenCallCount === 1 ? "call" : "calls"}
+                </span>
+              </span>
+              <span className="shrink-0 text-xs font-[650] text-blue-700">
+                {areHiddenCallsExpanded ? "Collapse" : "Expand"}
+              </span>
+            </button>
+
+            {areHiddenCallsExpanded ? (
+              <div className="flex flex-col gap-2" id="hidden-calls-panel">
+                <button
+                  className={`${neutralButtonClass} min-h-[30px] w-full px-2 text-xs font-[650]`}
+                  disabled={!isLoaded}
+                  type="button"
+                  onClick={showHiddenCalls}
+                >
+                  Unhide all sources
+                </button>
+                <CallList
+                  calls={sortedHiddenCalls}
+                  config={config}
+                  isLoaded={isLoaded}
+                  onDisable={disableCall}
+                  onDisableSource={disableCallSource}
+                  onInvoke={invokeCall}
+                  onShowSource={showHiddenCallSource}
+                />
+              </div>
+            ) : null}
+          </div>
+        ) : null}
+
+        {disabledSources.length > 0 ? (
+          <div className="flex flex-col gap-2 border-t border-slate-200 pt-2.5">
+            <button
+              aria-controls="disabled-sources-panel"
+              aria-expanded={areDisabledSourcesExpanded}
+              className={`${neutralButtonClass} flex min-h-[42px] w-full items-center justify-between gap-3 px-3 py-2 text-left`}
+              disabled={!isLoaded}
+              type="button"
+              onClick={() => setAreDisabledSourcesExpanded((isExpanded) => !isExpanded)}
+            >
+              <span className="min-w-0">
+                <span className="block text-xs font-[720] text-slate-900">Disabled sources</span>
+                <span className="block text-[11px] text-slate-500">
+                  {numberFormatter.format(disabledSources.length)} blocked source{" "}
+                  {disabledSources.length === 1 ? "location" : "locations"}
+                </span>
+              </span>
+              <span className="shrink-0 text-xs font-[650] text-blue-700">
+                {areDisabledSourcesExpanded ? "Collapse" : "Expand"}
+              </span>
+            </button>
+
+            {areDisabledSourcesExpanded ? (
+              <div className="flex flex-col gap-2" id="disabled-sources-panel">
+                <button
+                  className={`${neutralButtonClass} min-h-[30px] w-full px-2 text-xs font-[650]`}
+                  disabled={!isLoaded}
+                  type="button"
+                  onClick={clearDisabledSources}
+                >
+                  Re-enable all sources
+                </button>
+                <div className="flex flex-col gap-2">
+                  {disabledSources.map((source) => (
+                    <div
+                      className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 rounded-lg border border-slate-200 bg-white p-2"
+                      key={source.key}
+                    >
+                      <span
+                        className="truncate font-mono text-[10px] text-slate-500"
+                        title={source.label}
+                      >
+                        {source.label}
+                      </span>
+                      <button
+                        className={`${neutralButtonClass} min-h-[28px] px-2 text-xs font-[650]`}
+                        disabled={!isLoaded}
+                        type="button"
+                        onClick={() => enableDisabledSource(source.key)}
+                      >
+                        Enable
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+          </div>
+        ) : null}
       </section>
     </main>
   );

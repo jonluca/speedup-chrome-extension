@@ -1,10 +1,13 @@
 export const SPEED_CONFIG_STORAGE_KEY = "speedup:config";
+export const SPEED_DISABLED_CALL_SOURCES_STORAGE_KEY = "speedup:disabled-call-sources";
+export const SPEED_HIDDEN_CALL_SOURCES_STORAGE_KEY = "speedup:hidden-call-sources";
 export const SPEED_TAB_STATS_STORAGE_KEY_PREFIX = "speedup:stats:tab";
 
 export const SPEED_MESSAGE_TYPE = "speedup-extension:config";
 export const SPEED_STATS_MESSAGE_TYPE = "speedup-extension:stats";
 export const SPEED_CALLS_CHANGED_MESSAGE_TYPE = "speedup-extension:calls-changed";
 export const SPEED_CALLS_COMMAND_MESSAGE_TYPE = "speedup-extension:calls-command";
+export const SPEED_CALLS_DISABLED_SOURCES_MESSAGE_TYPE = "speedup-extension:calls-disabled-sources";
 export const SPEED_CALLS_LIST_MESSAGE_TYPE = "speedup-extension:calls-list";
 export const SPEED_CALLS_REFRESH_MESSAGE_TYPE = "speedup-extension:calls-refresh";
 
@@ -12,11 +15,18 @@ export const MIN_SPEED = 1;
 export const MAX_SPEED = 100;
 export const SPEED_STEP = 0.25;
 
+export const SPEED_CALL_COMMANDS = ["invoke", "disable", "disable-source"] as const;
 export const SPEED_FUNCTIONS = ["setTimeout", "setInterval", "requestAnimationFrame"] as const;
 export const SPEED_MODES = ["automatic", "manual"] as const;
 
+export type SpeedCallCommand = (typeof SPEED_CALL_COMMANDS)[number];
 export type SpeedFunctionName = (typeof SPEED_FUNCTIONS)[number];
 export type SpeedMode = (typeof SPEED_MODES)[number];
+
+export type SpeedCallSource = {
+  key: string;
+  label: string;
+};
 
 export type SpeedFunctionSettings = Record<SpeedFunctionName, boolean>;
 
@@ -47,6 +57,8 @@ export type SpeedCallSnapshot = {
   publicId: number;
   remainingMs: number;
   speed: number;
+  sourceKey: string;
+  sourceLabel: string;
   type: "interval" | "timeout";
   url: string;
 };
@@ -240,6 +252,63 @@ export function normalizeSpeedCallPanelItems(value: unknown): SpeedCallPanelItem
   return items;
 }
 
+export function normalizeHiddenCallSourceKeys(value: unknown): string[] {
+  return normalizeCallSourceKeys(value);
+}
+
+export function normalizeCallSourceKeys(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const keys = new Set<string>();
+
+  for (const key of value) {
+    const normalizedKey = isRecord(key)
+      ? normalizeNonEmptyString(key.key)
+      : normalizeNonEmptyString(key);
+
+    if (normalizedKey) {
+      keys.add(normalizedKey);
+    }
+  }
+
+  return Array.from(keys).sort();
+}
+
+export function normalizeSpeedCallSources(value: unknown): SpeedCallSource[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const sources = new Map<string, SpeedCallSource>();
+
+  for (const source of value) {
+    const key = isRecord(source)
+      ? normalizeNonEmptyString(source.key)
+      : normalizeNonEmptyString(source);
+
+    if (!key) {
+      continue;
+    }
+
+    sources.set(key, {
+      key,
+      label: isRecord(source) ? (normalizeNonEmptyString(source.label) ?? key) : key,
+    });
+  }
+
+  return Array.from(sources.values()).sort((left, right) => left.label.localeCompare(right.label));
+}
+
+export function normalizeSpeedCallCommand(value: unknown): SpeedCallCommand {
+  if (value === "disable" || value === "disable-source") {
+    return value;
+  }
+
+  return "invoke";
+}
+
 export function addSpeedStatsIncrements(
   stats: unknown,
   increments: SpeedStatsIncrement[],
@@ -391,6 +460,8 @@ function normalizeSpeedCallSnapshot(value: unknown): SpeedCallSnapshot | undefin
     return undefined;
   }
 
+  const sourceKey = normalizeNonEmptyString(value.sourceKey) ?? id;
+
   return {
     addedAt: normalizeFiniteNumber(value.addedAt),
     delay: normalizeNonNegativeNumber(value.delay),
@@ -401,6 +472,8 @@ function normalizeSpeedCallSnapshot(value: unknown): SpeedCallSnapshot | undefin
     publicId: normalizeNonNegativeInteger(value.publicId),
     remainingMs: normalizeNonNegativeNumber(value.remainingMs),
     speed: clampSpeed(value.speed),
+    sourceKey,
+    sourceLabel: normalizeNonEmptyString(value.sourceLabel) ?? sourceKey,
     type,
     url: normalizeNonEmptyString(value.url) ?? "",
   };

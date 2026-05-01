@@ -5,6 +5,7 @@ import {
   DEFAULT_SPEED_CONFIG,
   getSpeedStatsStorageKey,
   normalizeFrameId,
+  normalizeSpeedCallCommand,
   normalizeSpeedCallSnapshots,
   normalizeTabId,
   normalizeSpeedStatsIncrements,
@@ -163,6 +164,8 @@ async function sendCallCommand(message: unknown): Promise<{ ok: boolean }> {
   const tabId = normalizeTabId((message as { tabId?: unknown }).tabId);
   const frameId = normalizeFrameId((message as { frameId?: unknown }).frameId);
   const callId = (message as { callId?: unknown }).callId;
+  const command = normalizeSpeedCallCommand((message as { command?: unknown }).command);
+  const sourceKey = (message as { sourceKey?: unknown }).sourceKey;
 
   if (tabId == null || frameId == null || typeof callId !== "string") {
     return { ok: false };
@@ -173,6 +176,8 @@ async function sendCallCommand(message: unknown): Promise<{ ok: boolean }> {
       tabId,
       {
         callId,
+        command,
+        sourceKey,
         type: SPEED_CALLS_COMMAND_MESSAGE_TYPE,
       },
       { frameId },

@@ -3,9 +3,12 @@ import {
   effectiveSpeed,
   isHostnameExcluded,
   isSpeedFunctionEnabled,
+  normalizeSpeedCallSources,
+  normalizeSpeedCallCommand,
   normalizeSpeedConfig,
   SPEED_CALLS_CHANGED_MESSAGE_TYPE,
   SPEED_CALLS_COMMAND_MESSAGE_TYPE,
+  SPEED_CALLS_DISABLED_SOURCES_MESSAGE_TYPE,
   SPEED_CALLS_REFRESH_MESSAGE_TYPE,
   SPEED_MESSAGE_TYPE,
   SPEED_STATS_MESSAGE_TYPE,
@@ -40,9 +43,16 @@ type TimerRecord = {
   publicId: number;
   remainingVirtualMs: number;
   scheduledSpeed: number;
+  sourceKey: string;
+  sourceLabel: string;
   startedAt: number;
   type: "interval" | "timeout";
   args: TimerArgs;
+};
+
+type TimerSource = {
+  key: string;
+  label: string;
 };
 
 type SpeedFunctionSpeeds = Record<SpeedFunctionName, number>;
@@ -66,7 +76,9 @@ export default defineUnlistedScript(() => {
   let virtualClockBase = originalPerformanceNow();
   let realClockBase = virtualClockBase;
   let nextCallSequence = 1;
+  let nextSuppressedTimerId = -1;
 
+  let disabledSourceKeys = new Set<string>();
   const timers = new Map<number, TimerRecord>();
   const timerCallIds = new Map<string, TimerRecord>();
   const animationFrames = new Map<number, number>();
@@ -138,12 +150,90 @@ export default defineUnlistedScript(() => {
     return callId;
   }
 
+  function createSuppressedTimerId(): number {
+    const id = nextSuppressedTimerId;
+    nextSuppressedTimerId -= 1;
+    return id;
+  }
+
   function getHandlerLabel(handler: TimeoutHandler): string {
     if (typeof handler === "string") {
       return "string handler";
     }
 
     return handler.name ? `${handler.name}()` : "anonymous handler";
+  }
+
+  function isInternalStackLocation(location: string): boolean {
+    return (
+      location.includes("/speed-page.js:") ||
+      location.startsWith("chrome-extension://") ||
+      location.startsWith("moz-extension://")
+    );
+  }
+
+  function normalizeStackLocation(location: string): string {
+    const match = location.match(/^(.*):(\d+):(\d+)$/);
+
+    if (!match) {
+      return location;
+    }
+
+    const [, rawUrl, line, column] = match;
+
+    try {
+      const url = new URL(rawUrl);
+      url.hash = "";
+      return `${url.href}:${line}:${column}`;
+    } catch {
+      return location;
+    }
+  }
+
+  function getStackFrameLocation(frame: string): string | undefined {
+    const trimmed = frame.trim();
+
+    if (!trimmed || trimmed === "Error") {
+      return undefined;
+    }
+
+    const withoutAt = trimmed.replace(/^at\s+/, "");
+    const parenthesizedLocation = withoutAt.match(/\((.+)\)$/);
+    const rawLocation = parenthesizedLocation?.[1] ?? withoutAt;
+    const locationMatch = rawLocation.match(/(.+:\d+:\d+)$/);
+
+    if (!locationMatch) {
+      return undefined;
+    }
+
+    const location = normalizeStackLocation(locationMatch[1]);
+    return isInternalStackLocation(location) ? undefined : location;
+  }
+
+  function getTimerSource(
+    functionName: SpeedCallFunctionName,
+    handlerLabel: string,
+    delay: number,
+  ): TimerSource {
+    const stack = new Error().stack;
+
+    if (typeof stack === "string") {
+      for (const frame of stack.split("\n")) {
+        const location = getStackFrameLocation(frame);
+
+        if (location) {
+          return {
+            key: `${functionName}:${location}`,
+            label: location,
+          };
+        }
+      }
+    }
+
+    return {
+      key: `${functionName}:unknown:${handlerLabel}:${delay}`,
+      label: "unknown location",
+    };
   }
 
   function getNativeDelay(virtualDelay: number, speed: number): number {
@@ -203,6 +293,8 @@ export default defineUnlistedScript(() => {
       publicId: record.publicId,
       remainingMs,
       speed: record.scheduledSpeed,
+      sourceKey: record.sourceKey,
+      sourceLabel: record.sourceLabel,
       type: record.type,
       url: window.location.href,
     };
@@ -271,9 +363,7 @@ export default defineUnlistedScript(() => {
     }
 
     if (record.type === "timeout") {
-      timers.delete(record.publicId);
-      timerCallIds.delete(record.callId);
-      record.active = false;
+      removeTimerRecord(record);
       scheduleCallsFlush();
     }
 
@@ -283,6 +373,18 @@ export default defineUnlistedScript(() => {
       record.remainingVirtualMs = record.delay;
       scheduleTimer(record);
     }
+  }
+
+  function removeTimerRecord(record: TimerRecord): void {
+    record.active = false;
+    timers.delete(record.publicId);
+    timerCallIds.delete(record.callId);
+  }
+
+  function cancelTimerRecord(record: TimerRecord): void {
+    removeTimerRecord(record);
+    originalClearTimeout(record.nativeId);
+    scheduleCallsFlush();
   }
 
   function scheduleTimer(record: TimerRecord, notify = true): void {
@@ -313,11 +415,7 @@ export default defineUnlistedScript(() => {
       return false;
     }
 
-    record.active = false;
-    timers.delete(publicId);
-    timerCallIds.delete(record.callId);
-    originalClearTimeout(record.nativeId);
-    scheduleCallsFlush();
+    cancelTimerRecord(record);
     return true;
   }
 
@@ -366,6 +464,87 @@ export default defineUnlistedScript(() => {
     flushSpeedCalls();
   }
 
+  function disableCall(callId: unknown): void {
+    if (typeof callId !== "string") {
+      return;
+    }
+
+    const record = timerCallIds.get(callId);
+
+    if (
+      !record ||
+      !record.active ||
+      config.mode !== "manual" ||
+      !isSpeedChangeAllowed(record.functionName)
+    ) {
+      flushSpeedCalls();
+      return;
+    }
+
+    cancelTimerRecord(record);
+    flushSpeedCalls();
+  }
+
+  function getSourceKeyFromCommand(sourceKey: unknown, callId: unknown): string | undefined {
+    const normalizedSourceKey = normalizeSpeedCallSources([sourceKey])[0]?.key;
+
+    if (normalizedSourceKey) {
+      return normalizedSourceKey;
+    }
+
+    if (typeof callId !== "string") {
+      return undefined;
+    }
+
+    return timerCallIds.get(callId)?.sourceKey;
+  }
+
+  function cancelCallsBySource(sourceKey: string): void {
+    let changed = false;
+
+    for (const record of Array.from(timers.values())) {
+      if (!record.active || record.sourceKey !== sourceKey) {
+        continue;
+      }
+
+      cancelTimerRecord(record);
+      changed = true;
+    }
+
+    if (changed) {
+      flushSpeedCalls();
+    }
+  }
+
+  function disableCallSource(sourceKey: unknown, callId: unknown): void {
+    const normalizedSourceKey = getSourceKeyFromCommand(sourceKey, callId);
+
+    if (!normalizedSourceKey) {
+      flushSpeedCalls();
+      return;
+    }
+
+    disabledSourceKeys.add(normalizedSourceKey);
+    cancelCallsBySource(normalizedSourceKey);
+    flushSpeedCalls();
+  }
+
+  function handleCallCommand(command: unknown, callId: unknown, sourceKey: unknown): void {
+    const normalizedCommand = normalizeSpeedCallCommand(command);
+
+    if (normalizedCommand === "disable-source") {
+      disableCallSource(sourceKey, callId);
+      return;
+    }
+
+    if (normalizedCommand === "disable") {
+      disableCall(callId);
+      return;
+    }
+
+    invokeCallNow(callId);
+  }
+
   function updateConfig(nextConfig: unknown): void {
     const now = originalPerformanceNow();
     const previousSpeeds = getCurrentSpeeds();
@@ -377,12 +556,28 @@ export default defineUnlistedScript(() => {
     scheduleCallsFlush();
   }
 
+  function updateDisabledCallSources(sources: unknown): void {
+    disabledSourceKeys = new Set(normalizeSpeedCallSources(sources).map((source) => source.key));
+
+    for (const sourceKey of disabledSourceKeys) {
+      cancelCallsBySource(sourceKey);
+    }
+
+    scheduleCallsFlush();
+  }
+
   function managedSetTimeout(handler: TimeoutHandler, delay?: number, ...args: TimerArgs): number {
     if (!shouldManageTimer("setTimeout")) {
       return originalSetTimeout(handler, delay, ...args);
     }
 
     const normalizedDelay = normalizeDelay(delay);
+    const handlerLabel = getHandlerLabel(handler);
+    const source = getTimerSource("setTimeout", handlerLabel, normalizedDelay);
+
+    if (disabledSourceKeys.has(source.key)) {
+      return createSuppressedTimerId();
+    }
 
     const record: TimerRecord = {
       active: true,
@@ -392,11 +587,13 @@ export default defineUnlistedScript(() => {
       delay: normalizedDelay,
       functionName: "setTimeout",
       handler,
-      handlerLabel: getHandlerLabel(handler),
+      handlerLabel,
       nativeId: 0,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
       scheduledSpeed: 1,
+      sourceKey: source.key,
+      sourceLabel: source.label,
       startedAt: 0,
       type: "timeout",
     };
@@ -420,6 +617,12 @@ export default defineUnlistedScript(() => {
     }
 
     const normalizedDelay = normalizeDelay(delay);
+    const handlerLabel = getHandlerLabel(handler);
+    const source = getTimerSource("setInterval", handlerLabel, normalizedDelay);
+
+    if (disabledSourceKeys.has(source.key)) {
+      return createSuppressedTimerId();
+    }
 
     const record: TimerRecord = {
       active: true,
@@ -429,11 +632,13 @@ export default defineUnlistedScript(() => {
       delay: normalizedDelay,
       functionName: "setInterval",
       handler,
-      handlerLabel: getHandlerLabel(handler),
+      handlerLabel,
       nativeId: 0,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
       scheduledSpeed: 1,
+      sourceKey: source.key,
+      sourceLabel: source.label,
       startedAt: 0,
       type: "interval",
     };
@@ -531,8 +736,13 @@ export default defineUnlistedScript(() => {
       return;
     }
 
+    if (event.data?.type === SPEED_CALLS_DISABLED_SOURCES_MESSAGE_TYPE) {
+      updateDisabledCallSources(event.data.sources);
+      return;
+    }
+
     if (event.data?.type === SPEED_CALLS_COMMAND_MESSAGE_TYPE) {
-      invokeCallNow(event.data.callId);
+      handleCallCommand(event.data.command, event.data.callId, event.data.sourceKey);
     }
   });
 

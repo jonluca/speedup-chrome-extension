@@ -33,6 +33,15 @@ body::-webkit-scrollbar {
   display: none;
 }
 
+.call-list {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.call-list::-webkit-scrollbar {
+  display: none;
+}
+
 button,
 input {
   font: inherit;
