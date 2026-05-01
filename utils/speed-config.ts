@@ -35,6 +35,7 @@ export type SpeedConfig = {
   enabledFunctions: SpeedFunctionSettings;
   excludedHosts: string[];
   mode: SpeedMode;
+  pauseInvocations: boolean;
   speed: number;
 };
 
@@ -73,6 +74,7 @@ export const DEFAULT_SPEED_CONFIG: SpeedConfig = {
   enabledFunctions: createDefaultSpeedFunctionSettings(),
   excludedHosts: [],
   mode: "automatic",
+  pauseInvocations: false,
   speed: 2,
 };
 
@@ -95,6 +97,10 @@ export function normalizeSpeedConfig(value: unknown): SpeedConfig {
     enabledFunctions: normalizeSpeedFunctionSettings(config.enabledFunctions),
     excludedHosts: normalizeExcludedHosts(config.excludedHosts),
     mode: isSpeedMode(config.mode) ? config.mode : DEFAULT_SPEED_CONFIG.mode,
+    pauseInvocations:
+      typeof config.pauseInvocations === "boolean"
+        ? config.pauseInvocations
+        : DEFAULT_SPEED_CONFIG.pauseInvocations,
     speed: clampSpeed(config.speed),
   };
 }

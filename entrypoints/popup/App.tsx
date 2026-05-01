@@ -143,6 +143,7 @@ export default function App() {
       ...config,
       enabled: true,
       mode,
+      pauseInvocations: mode === "automatic" ? false : config.pauseInvocations,
     });
   }
 
@@ -214,11 +215,22 @@ export default function App() {
     }
 
     if (config.mode === "manual") {
+      if (config.pauseInvocations) {
+        return "Manual pause";
+      }
+
       return "Manual";
     }
 
     return formatSpeedLabel(config.speed);
-  }, [config.enabled, config.mode, config.speed, enabledFunctionCount, isCurrentSiteExcluded]);
+  }, [
+    config.enabled,
+    config.mode,
+    config.pauseInvocations,
+    config.speed,
+    enabledFunctionCount,
+    isCurrentSiteExcluded,
+  ]);
 
   const statsRows = useMemo(
     () =>

@@ -39,7 +39,7 @@ type TimerRecord = {
   functionName: SpeedCallFunctionName;
   handler: TimeoutHandler;
   handlerLabel: string;
-  nativeId: number;
+  nativeId: number | undefined;
   publicId: number;
   remainingVirtualMs: number;
   scheduledSpeed: number;
@@ -76,7 +76,7 @@ export default defineUnlistedScript(() => {
   let virtualClockBase = originalPerformanceNow();
   let realClockBase = virtualClockBase;
   let nextCallSequence = 1;
-  let nextSuppressedTimerId = -1;
+  let nextSyntheticTimerId = -1;
 
   let disabledSourceKeys = new Set<string>();
   const timers = new Map<number, TimerRecord>();
@@ -115,6 +115,12 @@ export default defineUnlistedScript(() => {
     return config.mode === "manual" || config.speed > 1;
   }
 
+  function shouldPauseTimerInvocations(functionName: SpeedCallFunctionName): boolean {
+    return (
+      config.mode === "manual" && config.pauseInvocations && isSpeedChangeAllowed(functionName)
+    );
+  }
+
   function getTimerSpeed(record: TimerRecord): number {
     if (!isSpeedChangeAllowed(record.functionName)) {
       return 1;
@@ -150,10 +156,14 @@ export default defineUnlistedScript(() => {
     return callId;
   }
 
-  function createSuppressedTimerId(): number {
-    const id = nextSuppressedTimerId;
-    nextSuppressedTimerId -= 1;
+  function createSyntheticTimerId(): number {
+    const id = nextSyntheticTimerId;
+    nextSyntheticTimerId -= 1;
     return id;
+  }
+
+  function createSuppressedTimerId(): number {
+    return createSyntheticTimerId();
   }
 
   function getHandlerLabel(handler: TimeoutHandler): string {
@@ -272,6 +282,10 @@ export default defineUnlistedScript(() => {
   }
 
   function getTimerRemainingMs(record: TimerRecord, now = originalPerformanceNow()): number {
+    if (record.nativeId == null) {
+      return getNativeDelay(record.remainingVirtualMs, record.scheduledSpeed);
+    }
+
     const elapsedVirtualMs = (now - record.startedAt) * record.scheduledSpeed;
     const remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
     return getNativeDelay(remainingVirtualMs, record.scheduledSpeed);
@@ -383,15 +397,30 @@ export default defineUnlistedScript(() => {
 
   function cancelTimerRecord(record: TimerRecord): void {
     removeTimerRecord(record);
-    originalClearTimeout(record.nativeId);
+    if (record.nativeId != null) {
+      originalClearTimeout(record.nativeId);
+      record.nativeId = undefined;
+    }
     scheduleCallsFlush();
   }
 
   function scheduleTimer(record: TimerRecord, notify = true): void {
-    const speed = getTimerSpeed(record);
+    const isPaused = shouldPauseTimerInvocations(record.functionName);
+    const speed = isPaused ? 1 : getTimerSpeed(record);
 
     record.scheduledSpeed = speed;
     record.startedAt = originalPerformanceNow();
+
+    if (isPaused) {
+      record.nativeId = undefined;
+
+      if (notify) {
+        scheduleCallsFlush();
+      }
+
+      return;
+    }
+
     record.nativeId = originalSetTimeout(
       () => {
         completeTimerOccurrence(record);
@@ -420,10 +449,13 @@ export default defineUnlistedScript(() => {
   }
 
   function rescheduleTimer(record: TimerRecord, now = originalPerformanceNow()): void {
-    const elapsedVirtualMs = (now - record.startedAt) * record.scheduledSpeed;
-    record.remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
+    if (record.nativeId != null) {
+      const elapsedVirtualMs = (now - record.startedAt) * record.scheduledSpeed;
+      record.remainingVirtualMs = Math.max(0, record.remainingVirtualMs - elapsedVirtualMs);
+      originalClearTimeout(record.nativeId);
+      record.nativeId = undefined;
+    }
 
-    originalClearTimeout(record.nativeId);
     scheduleTimer(record);
   }
 
@@ -454,7 +486,10 @@ export default defineUnlistedScript(() => {
       return;
     }
 
-    originalClearTimeout(record.nativeId);
+    if (record.nativeId != null) {
+      originalClearTimeout(record.nativeId);
+      record.nativeId = undefined;
+    }
 
     if (record.delay > 0) {
       logSpeedTrigger(record.functionName, true);
@@ -588,7 +623,7 @@ export default defineUnlistedScript(() => {
       functionName: "setTimeout",
       handler,
       handlerLabel,
-      nativeId: 0,
+      nativeId: undefined,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
       scheduledSpeed: 1,
@@ -603,7 +638,7 @@ export default defineUnlistedScript(() => {
     }
 
     scheduleTimer(record, false);
-    record.publicId = record.nativeId;
+    record.publicId = record.nativeId ?? createSyntheticTimerId();
     timers.set(record.publicId, record);
     timerCallIds.set(record.callId, record);
     scheduleCallsFlush();
@@ -633,7 +668,7 @@ export default defineUnlistedScript(() => {
       functionName: "setInterval",
       handler,
       handlerLabel,
-      nativeId: 0,
+      nativeId: undefined,
       publicId: 0,
       remainingVirtualMs: normalizedDelay,
       scheduledSpeed: 1,
@@ -648,7 +683,7 @@ export default defineUnlistedScript(() => {
     }
 
     scheduleTimer(record, false);
-    record.publicId = record.nativeId;
+    record.publicId = record.nativeId ?? createSyntheticTimerId();
     timers.set(record.publicId, record);
     timerCallIds.set(record.callId, record);
     scheduleCallsFlush();

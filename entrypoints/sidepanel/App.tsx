@@ -42,25 +42,39 @@ const customSpeedInputBaseClass =
   "min-h-[34px] min-w-0 rounded-lg border px-2 text-center focus-visible:outline-[3px] focus-visible:outline-offset-1 focus-visible:outline-blue-600/25 disabled:cursor-not-allowed disabled:opacity-[0.55]";
 const customSpeedInputClass = `${customSpeedInputBaseClass} border-slate-300 bg-white text-slate-800`;
 const selectedCustomSpeedInputClass = `${customSpeedInputBaseClass} border-blue-600 bg-blue-600 text-white`;
-const CALL_ROW_RETENTION_MS = 1500;
-const TIMER_TICK_MS = 250;
+const CALL_ROW_RETENTION_MS = 3000;
+const CALLS_COMMIT_DELAY_MS = 250;
+const LIVE_STATUS_GRACE_MS = 750;
+const TIMER_TICK_MS = 500;
 
 type SortMode = "duration" | "recent";
 
 type DisplayedSpeedCallPanelItem = SpeedCallPanelItem & {
+  activeCount: number;
   displayKey: string;
+  firstSeenAt: number;
   isLive: boolean;
   lastSeenAt: number;
 };
 
 type TimedSpeedCallPanelItem = DisplayedSpeedCallPanelItem & {
   ageMs: number;
+  inactiveMs: number;
+  isRecentlyActive: boolean;
   remainingMs: number;
 };
 
 type RetainedCallRecord = {
+  activeCount: number;
   call: SpeedCallPanelItem;
+  firstSeenAt: number;
   lastSeenAt: number;
+};
+
+type AggregatedCallRecord = {
+  activeCount: number;
+  call: SpeedCallPanelItem;
+  firstAddedAt: number;
 };
 
 type ActiveTab = {
@@ -123,10 +137,19 @@ function sortTimedCalls(
 ): TimedSpeedCallPanelItem[] {
   return calls.toSorted((left, right) => {
     if (sortMode === "recent") {
-      return right.lastSeenAt - left.lastSeenAt || right.addedAt - left.addedAt;
+      return (
+        right.lastSeenAt - left.lastSeenAt ||
+        left.firstSeenAt - right.firstSeenAt ||
+        left.sourceLabel.localeCompare(right.sourceLabel)
+      );
     }
 
-    return right.remainingMs - left.remainingMs;
+    return (
+      right.delay - left.delay ||
+      right.lastSeenAt - left.lastSeenAt ||
+      left.firstSeenAt - right.firstSeenAt ||
+      left.sourceLabel.localeCompare(right.sourceLabel)
+    );
   });
 }
 
@@ -139,6 +162,54 @@ function getRepresentativeCall(
   }
 
   return left;
+}
+
+function aggregateCall(
+  callsByRetentionKey: Map<string, AggregatedCallRecord>,
+  call: SpeedCallPanelItem,
+): void {
+  const retentionKey = getCallRetentionKey(call);
+  const current = callsByRetentionKey.get(retentionKey);
+
+  if (!current) {
+    callsByRetentionKey.set(retentionKey, {
+      activeCount: 1,
+      call,
+      firstAddedAt: call.addedAt,
+    });
+    return;
+  }
+
+  callsByRetentionKey.set(retentionKey, {
+    activeCount: current.activeCount + 1,
+    call: getRepresentativeCall(current.call, call),
+    firstAddedAt: Math.min(current.firstAddedAt, call.addedAt),
+  });
+}
+
+function mergeSampledCalls(
+  currentCalls: SpeedCallPanelItem[] | undefined,
+  nextCalls: SpeedCallPanelItem[],
+): SpeedCallPanelItem[] {
+  if (!currentCalls || currentCalls.length === 0) {
+    return nextCalls;
+  }
+
+  if (nextCalls.length === 0) {
+    return currentCalls;
+  }
+
+  const sampledCallsByRetentionKey = new Map<string, AggregatedCallRecord>();
+
+  for (const call of currentCalls) {
+    aggregateCall(sampledCallsByRetentionKey, call);
+  }
+
+  for (const call of nextCalls) {
+    aggregateCall(sampledCallsByRetentionKey, call);
+  }
+
+  return Array.from(sampledCallsByRetentionKey.values()).map((record) => record.call);
 }
 
 function pruneRetainedCalls(
@@ -170,6 +241,7 @@ type CallCardProps = {
   isLoaded: boolean;
   onDisable: (call: SpeedCallPanelItem) => void;
   onDisableSource: (call: SpeedCallPanelItem) => void;
+  onHide?: (call: SpeedCallPanelItem) => void;
   onInvoke: (call: SpeedCallPanelItem) => void;
   onShowSource?: (call: SpeedCallPanelItem) => void;
 };
@@ -180,6 +252,7 @@ function CallCard({
   isLoaded,
   onDisable,
   onDisableSource,
+  onHide,
   onInvoke,
   onShowSource,
 }: CallCardProps) {
@@ -189,13 +262,21 @@ function CallCard({
     config.enabledFunctions[call.functionName] &&
     !isHostnameExcluded(config, callHost);
   const isCallRunningFast = call.speed > MIN_SPEED;
+  const isManualPauseActive =
+    config.mode === "manual" && config.pauseInvocations && isCallSpeedAllowed;
   const canDisableSource = isLoaded && config.mode === "manual" && isCallSpeedAllowed;
   const canToggleCall = call.isLive && canDisableSource;
-  const statusLabel = call.isLive
-    ? isCallRunningFast
-      ? formatSpeedLabel(call.speed)
-      : "normal"
+  const statusLabel = call.isRecentlyActive
+    ? isManualPauseActive
+      ? "paused"
+      : isCallRunningFast
+        ? formatSpeedLabel(call.speed)
+        : "normal"
     : "recent";
+  const activeCountLabel =
+    call.isLive && call.activeCount > 1
+      ? `, ${numberFormatter.format(call.activeCount)} active`
+      : "";
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-slate-200 bg-white p-3">
@@ -207,6 +288,7 @@ function CallCard({
           <span className="block truncate text-[11px] text-slate-500">
             {call.handlerLabel}
             {callHost ? `, ${callHost}` : ""}
+            {activeCountLabel}
           </span>
           <span
             className="block truncate font-mono text-[10px] text-slate-400"
@@ -215,23 +297,37 @@ function CallCard({
             {call.sourceLabel}
           </span>
         </div>
-        <span
-          className={`shrink-0 rounded-full px-2 py-1 text-[11px] font-[720] ${
-            call.isLive && isCallRunningFast
-              ? "bg-blue-100 text-blue-700"
-              : "bg-slate-100 text-slate-600"
-          }`}
-        >
-          {statusLabel}
-        </span>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {onHide ? (
+            <button
+              aria-label="Hide this card"
+              className={`${neutralButtonClass} min-h-[24px] px-1.5 text-[11px] font-[650]`}
+              disabled={!isLoaded}
+              title="Hide this card"
+              type="button"
+              onClick={() => onHide(call)}
+            >
+              Hide
+            </button>
+          ) : null}
+          <span
+            className={`rounded-full px-2 py-1 text-[11px] font-[720] ${
+              call.isRecentlyActive && (isManualPauseActive || isCallRunningFast)
+                ? "bg-blue-100 text-blue-700"
+                : "bg-slate-100 text-slate-600"
+            }`}
+          >
+            {statusLabel}
+          </span>
+        </div>
       </div>
 
       <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-500">
         <span>
           <strong className="block text-xs text-slate-900">
-            {formatDuration(call.remainingMs)}
+            {formatDuration(call.isLive ? call.remainingMs : call.inactiveMs)}
           </strong>
-          remaining
+          {call.isLive ? "remaining" : "last seen"}
         </span>
         <span>
           <strong className="block text-xs text-slate-900">{formatDuration(call.delay)}</strong>
@@ -239,7 +335,7 @@ function CallCard({
         </span>
         <span>
           <strong className="block text-xs text-slate-900">{formatDuration(call.ageMs)}</strong>
-          added ago
+          tracked
         </span>
       </div>
 
@@ -293,6 +389,7 @@ type CallListProps = {
   isLoaded: boolean;
   onDisable: (call: SpeedCallPanelItem) => void;
   onDisableSource: (call: SpeedCallPanelItem) => void;
+  onHide?: (call: SpeedCallPanelItem) => void;
   onInvoke: (call: SpeedCallPanelItem) => void;
   onShowSource?: (call: SpeedCallPanelItem) => void;
 };
@@ -303,6 +400,7 @@ function CallList({
   isLoaded,
   onDisable,
   onDisableSource,
+  onHide,
   onInvoke,
   onShowSource,
 }: CallListProps) {
@@ -320,6 +418,7 @@ function CallList({
             isLoaded={isLoaded}
             onDisable={onDisable}
             onDisableSource={onDisableSource}
+            onHide={onHide}
             onInvoke={onInvoke}
             onShowSource={onShowSource}
           />
@@ -391,19 +490,19 @@ export default function App() {
     setRetainedCalls((current) => {
       const receivedAt = Date.now();
       const next = new Map(pruneRetainedCalls(current, receivedAt, activeTab.id));
-      const representativeCalls = new Map<string, SpeedCallPanelItem>();
+      const activeCallsByRetentionKey = new Map<string, AggregatedCallRecord>();
 
       for (const call of calls) {
-        const retentionKey = getCallRetentionKey(call);
-        representativeCalls.set(
-          retentionKey,
-          getRepresentativeCall(representativeCalls.get(retentionKey), call),
-        );
+        aggregateCall(activeCallsByRetentionKey, call);
       }
 
-      for (const [retentionKey, call] of representativeCalls) {
+      for (const [retentionKey, activeCall] of activeCallsByRetentionKey) {
+        const previous = next.get(retentionKey);
+
         next.set(retentionKey, {
-          call,
+          activeCount: activeCall.activeCount,
+          call: activeCall.call,
+          firstSeenAt: previous?.firstSeenAt ?? activeCall.firstAddedAt,
           lastSeenAt: receivedAt,
         });
       }
@@ -452,6 +551,44 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let commitTimeoutId: number | undefined;
+    let lastCommittedAt = 0;
+    let queuedCalls: SpeedCallPanelItem[] | undefined;
+
+    const commitCalls = (nextCalls: SpeedCallPanelItem[]) => {
+      queuedCalls = undefined;
+      lastCommittedAt = Date.now();
+      setCalls(nextCalls);
+    };
+
+    const flushQueuedCalls = () => {
+      commitTimeoutId = undefined;
+
+      if (!queuedCalls) {
+        return;
+      }
+
+      commitCalls(queuedCalls);
+    };
+
+    const scheduleCallsCommit = (nextCalls: SpeedCallPanelItem[]) => {
+      const elapsedMs = Date.now() - lastCommittedAt;
+
+      if (elapsedMs >= CALLS_COMMIT_DELAY_MS && commitTimeoutId == null) {
+        commitCalls(nextCalls);
+        return;
+      }
+
+      queuedCalls = mergeSampledCalls(queuedCalls, nextCalls);
+
+      if (commitTimeoutId == null) {
+        commitTimeoutId = window.setTimeout(
+          flushQueuedCalls,
+          Math.max(0, CALLS_COMMIT_DELAY_MS - elapsedMs),
+        );
+      }
+    };
+
     const handleRuntimeMessage = (message: unknown) => {
       if (
         message == null ||
@@ -467,12 +604,16 @@ export default function App() {
         return;
       }
 
-      setCalls(normalizeSpeedCallPanelItems((message as { calls?: unknown }).calls));
+      scheduleCallsCommit(normalizeSpeedCallPanelItems((message as { calls?: unknown }).calls));
     };
 
     browser.runtime.onMessage.addListener(handleRuntimeMessage);
 
     return () => {
+      if (commitTimeoutId != null) {
+        window.clearTimeout(commitTimeoutId);
+      }
+
       browser.runtime.onMessage.removeListener(handleRuntimeMessage);
     };
   }, [activeTab.id]);
@@ -511,6 +652,16 @@ export default function App() {
       ...config,
       enabled: true,
       mode,
+      pauseInvocations: mode === "automatic" ? false : config.pauseInvocations,
+    });
+  }
+
+  async function savePauseInvocations(pauseInvocations: boolean) {
+    await saveConfig({
+      ...config,
+      enabled: pauseInvocations ? true : config.enabled,
+      mode: pauseInvocations ? "manual" : config.mode,
+      pauseInvocations,
     });
   }
 
@@ -651,6 +802,19 @@ export default function App() {
     void saveHiddenSourceKeys(next);
   }
 
+  function hideCallSource(call: SpeedCallPanelItem) {
+    const sourceKey = getCallSourceKey(call);
+
+    if (hiddenSourceKeys.has(sourceKey)) {
+      return;
+    }
+
+    const next = new Set(hiddenSourceKeys);
+    next.add(sourceKey);
+    setHiddenSourceKeys(next);
+    void saveHiddenSourceKeys(next);
+  }
+
   function showHiddenCalls() {
     const displayedHiddenSourceKeys = new Set(hiddenCalls.map(getCallSourceKey));
     const next = new Set<string>();
@@ -684,33 +848,25 @@ export default function App() {
     return new Set(disabledSources.map((source) => source.key));
   }, [disabledSources]);
   const displayCalls = useMemo<DisplayedSpeedCallPanelItem[]>(() => {
-    const activeCallsByRetentionKey = new Map<string, SpeedCallPanelItem[]>();
+    const activeCallsByRetentionKey = new Map<string, AggregatedCallRecord>();
 
     for (const call of calls) {
-      const retentionKey = getCallRetentionKey(call);
-      const retentionCalls = activeCallsByRetentionKey.get(retentionKey);
-
-      if (retentionCalls) {
-        retentionCalls.push(call);
-      } else {
-        activeCallsByRetentionKey.set(retentionKey, [call]);
-      }
+      aggregateCall(activeCallsByRetentionKey, call);
     }
 
     const displayItems: DisplayedSpeedCallPanelItem[] = [];
 
-    for (const [retentionKey, retentionCalls] of activeCallsByRetentionKey) {
-      const useSourceDisplayKey = retentionCalls.length === 1;
+    for (const [retentionKey, activeCall] of activeCallsByRetentionKey) {
       const retainedCall = retainedCalls.get(retentionKey);
 
-      for (const call of retentionCalls) {
-        displayItems.push({
-          ...call,
-          displayKey: useSourceDisplayKey ? retentionKey : `${retentionKey}:${call.id}`,
-          isLive: true,
-          lastSeenAt: retainedCall?.lastSeenAt ?? call.addedAt,
-        });
-      }
+      displayItems.push({
+        ...activeCall.call,
+        activeCount: activeCall.activeCount,
+        displayKey: retentionKey,
+        firstSeenAt: retainedCall?.firstSeenAt ?? activeCall.firstAddedAt,
+        isLive: true,
+        lastSeenAt: retainedCall?.lastSeenAt ?? activeCall.call.addedAt,
+      });
     }
 
     for (const [retentionKey, record] of retainedCalls) {
@@ -720,7 +876,9 @@ export default function App() {
 
       displayItems.push({
         ...record.call,
+        activeCount: 0,
         displayKey: retentionKey,
+        firstSeenAt: record.firstSeenAt,
         isLive: false,
         lastSeenAt: record.lastSeenAt,
       });
@@ -730,11 +888,17 @@ export default function App() {
   }, [calls, retainedCalls]);
 
   const callsWithTiming = useMemo(() => {
-    return displayCalls.map((call) => ({
-      ...call,
-      ageMs: Math.max(0, now - call.addedAt),
-      remainingMs: Math.max(0, call.dueAt - now),
-    }));
+    return displayCalls.map((call) => {
+      const inactiveMs = Math.max(0, now - call.lastSeenAt);
+
+      return {
+        ...call,
+        ageMs: Math.max(0, now - call.firstSeenAt),
+        inactiveMs,
+        isRecentlyActive: call.isLive || inactiveMs <= LIVE_STATUS_GRACE_MS,
+        remainingMs: Math.max(0, call.dueAt - now),
+      };
+    });
   }, [displayCalls, now]);
 
   const visibleCalls = useMemo(() => {
@@ -760,6 +924,7 @@ export default function App() {
   const sortedHiddenCalls = useMemo(() => {
     return sortTimedCalls(hiddenCalls, sortMode);
   }, [hiddenCalls, sortMode]);
+  const areInvocationsPaused = config.mode === "manual" && config.pauseInvocations;
   const hiddenCallCount = hiddenCalls.length;
 
   return (
@@ -785,6 +950,33 @@ export default function App() {
             {mode === "automatic" ? "Automatic" : "Manual"}
           </button>
         ))}
+      </section>
+
+      <section
+        className="flex min-h-[58px] items-center justify-between gap-3 rounded-lg border border-slate-200 bg-white px-3 py-2"
+        aria-label="Settings"
+      >
+        <div className="min-w-0">
+          <strong className="block text-sm font-[720] text-slate-900">Pause invocations</strong>
+          <span className="block text-[11px] text-slate-500">
+            Timer calls wait until you press Invoke now.
+          </span>
+        </div>
+        <label
+          aria-label="Pause all timer invocations"
+          className="relative inline-flex h-[26px] w-[46px] shrink-0 cursor-pointer"
+          title="Pause all timer invocations"
+        >
+          <input
+            className="peer sr-only"
+            checked={areInvocationsPaused}
+            disabled={!isLoaded}
+            type="checkbox"
+            onChange={(event) => void savePauseInvocations(event.currentTarget.checked)}
+          />
+          <span className="h-full w-full rounded-full bg-slate-300 transition-colors duration-150 peer-checked:bg-blue-600 peer-focus-visible:ring-[3px] peer-focus-visible:ring-blue-600/25 peer-disabled:cursor-not-allowed peer-disabled:opacity-[0.55]" />
+          <span className="pointer-events-none absolute left-[3px] top-[3px] h-5 w-5 rounded-full bg-white shadow-[0_1px_2px_rgb(15_23_42_/_22%)] transition-transform duration-150 peer-checked:translate-x-5 peer-disabled:opacity-[0.55]" />
+        </label>
       </section>
 
       <section
@@ -840,12 +1032,14 @@ export default function App() {
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             <h2 className="m-0 text-[13px] font-[720] leading-tight text-slate-900">
-              Active calls
+              Timer sources
             </h2>
             <p className="mb-0 mt-0.5 text-[11px] text-slate-500">
               {hiddenCallCount > 0
                 ? `${numberFormatter.format(sortedCalls.length)} visible, ${numberFormatter.format(hiddenCallCount)} hidden`
-                : `${numberFormatter.format(sortedCalls.length)} timer calls in this tab`}
+                : `${numberFormatter.format(sortedCalls.length)} timer ${
+                    sortedCalls.length === 1 ? "source" : "sources"
+                  } in this tab`}
             </p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
@@ -891,13 +1085,16 @@ export default function App() {
             isLoaded={isLoaded}
             onDisable={disableCall}
             onDisableSource={disableCallSource}
+            onHide={hideCallSource}
             onInvoke={invokeCall}
           />
         ) : (
           <div className="rounded-lg border border-dashed border-slate-300 bg-white px-3 py-8 text-center text-sm text-slate-500">
             {displayCalls.length > 0
               ? "All active timer sources are hidden. Calls from hidden locations stay hidden until you show them again."
-              : "No active timer calls for this tab. Manual mode tracks new timeout and interval calls as pages create them."}
+              : areInvocationsPaused
+                ? "No paused timer sources for this tab. New timeout and interval calls will wait here until invoked."
+                : "No active timer sources for this tab. Manual mode tracks new timeout and interval calls as pages create them."}
           </div>
         )}
 
@@ -912,10 +1109,10 @@ export default function App() {
               onClick={() => setAreHiddenCallsExpanded((isExpanded) => !isExpanded)}
             >
               <span className="min-w-0">
-                <span className="block text-xs font-[720] text-slate-900">Hidden calls</span>
+                <span className="block text-xs font-[720] text-slate-900">Hidden sources</span>
                 <span className="block text-[11px] text-slate-500">
                   {numberFormatter.format(hiddenCallCount)} hidden timer{" "}
-                  {hiddenCallCount === 1 ? "call" : "calls"}
+                  {hiddenCallCount === 1 ? "source" : "sources"}
                 </span>
               </span>
               <span className="shrink-0 text-xs font-[650] text-blue-700">
