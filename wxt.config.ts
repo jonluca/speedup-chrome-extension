@@ -23,11 +23,5 @@ export default defineConfig({
       default_icon: extensionIcons,
     },
     permissions: ["activeTab", "storage"],
-    web_accessible_resources: [
-      {
-        resources: ["speed-page.js"],
-        matches: ["<all_urls>"],
-      },
-    ],
   },
 });

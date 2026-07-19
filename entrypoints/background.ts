@@ -102,6 +102,19 @@ function recordSpeedCallSnapshot(message: unknown, sender: unknown): void {
       : "";
   let frameSnapshots = callSnapshotsByTabId.get(tabId);
 
+  if (calls.length === 0) {
+    if (!frameSnapshots?.delete(frameId)) {
+      return;
+    }
+
+    if (frameSnapshots.size === 0) {
+      callSnapshotsByTabId.delete(tabId);
+    }
+
+    void broadcastTabCalls(tabId);
+    return;
+  }
+
   if (!frameSnapshots) {
     frameSnapshots = new Map();
     callSnapshotsByTabId.set(tabId, frameSnapshots);

@@ -1,9 +1,7 @@
 import { browser } from "wxt/browser";
-import { injectScript } from "wxt/utils/inject-script";
 
 import {
   DEFAULT_SPEED_CONFIG,
-  isHostnameExcluded,
   normalizeSpeedCallSources,
   normalizeSpeedCallSnapshots,
   normalizeSpeedConfig,
@@ -55,60 +53,15 @@ export default defineContentScript({
   runAt: "document_start",
   allFrames: true,
   async main(ctx) {
-    let isScriptInjected = false;
     let latestDisabledCallSources: SpeedCallSource[] = [];
-    let latestConfig: SpeedConfig | undefined;
-    let scriptInjection: Promise<void> | undefined;
-
-    async function ensureSpeedScriptInjected(): Promise<void> {
-      if (isScriptInjected) {
-        return;
-      }
-
-      if (!scriptInjection) {
-        scriptInjection = injectScript("/speed-page.js", {
-          keepInDom: true,
-        })
-          .then(() => {
-            isScriptInjected = true;
-          })
-          .finally(() => {
-            scriptInjection = undefined;
-          });
-      }
-
-      await scriptInjection;
-    }
 
     async function applySpeedConfig(config: SpeedConfig): Promise<void> {
-      latestConfig = config;
-
       if (!ctx.isValid) {
         return;
       }
 
-      if (isHostnameExcluded(config, window.location.hostname)) {
-        if (isScriptInjected) {
-          postSpeedConfig(config);
-          postDisabledCallSources(latestDisabledCallSources);
-        } else if (scriptInjection) {
-          await scriptInjection;
-
-          if (ctx.isValid && latestConfig === config) {
-            postSpeedConfig(config);
-            postDisabledCallSources(latestDisabledCallSources);
-          }
-        }
-
-        return;
-      }
-
-      await ensureSpeedScriptInjected();
-
-      if (ctx.isValid && latestConfig === config) {
-        postSpeedConfig(config);
-        postDisabledCallSources(latestDisabledCallSources);
-      }
+      postSpeedConfig(config);
+      postDisabledCallSources(latestDisabledCallSources);
     }
 
     async function applyDisabledCallSources(sources: SpeedCallSource[]): Promise<void> {
@@ -118,17 +71,7 @@ export default defineContentScript({
         return;
       }
 
-      if (!isScriptInjected) {
-        if (!latestConfig || isHostnameExcluded(latestConfig, window.location.hostname)) {
-          return;
-        }
-
-        await ensureSpeedScriptInjected();
-      }
-
-      if (ctx.isValid && latestDisabledCallSources === sources) {
-        postDisabledCallSources(sources);
-      }
+      postDisabledCallSources(sources);
     }
 
     window.addEventListener("message", (event: MessageEvent) => {
@@ -199,6 +142,17 @@ export default defineContentScript({
       if (disabledSourcesChange) {
         void applyDisabledCallSources(normalizeSpeedCallSources(disabledSourcesChange.newValue));
       }
+    });
+
+    window.addEventListener("pagehide", () => {
+      void browser.runtime
+        .sendMessage({
+          calls: [],
+          capturedAt: Date.now(),
+          frameUrl: window.location.href,
+          type: SPEED_CALLS_CHANGED_MESSAGE_TYPE,
+        })
+        .catch(() => undefined);
     });
 
     const [initialConfig, initialDisabledCallSources] = await Promise.all([
