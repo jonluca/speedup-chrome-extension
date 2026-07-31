@@ -1,6 +1,6 @@
 # Speed Up Pages
 
-A Chrome extension that speeds up webpage timers and animation frames. It runs a small script in the page context on HTTP and HTTPS pages, then lets you control the speed multiplier from the extension popup.
+A Chrome extension that speeds up webpage timers and animation frames. It injects a small page script into HTTP and HTTPS pages, then lets you control the speed multiplier from the extension popup.
 
 ## Features
 
@@ -22,7 +22,7 @@ A Chrome extension that speeds up webpage timers and animation frames. It runs a
 
 ## How It Works
 
-The page-world content script runs at `document_start`, before page scripts can schedule timers. It wraps:
+The content script runs at `document_start` and injects `speed-page.js` into the page context. That page script wraps:
 
 - `setTimeout`
 - `setInterval`
@@ -31,7 +31,7 @@ The page-world content script runs at `document_start`, before page scripts can 
 - `requestAnimationFrame`
 - `cancelAnimationFrame`
 
-When the popup updates the speed setting, the isolated content script forwards the new config to the page-world content script so active timers can be rescheduled against the new multiplier.
+When the popup updates the speed setting, the content script forwards the new config to the page script so active timers can be rescheduled against the new multiplier.
 Each wrapped function type can be toggled independently from the popup's call tracking section.
 
 Automatic mode keeps the previous behavior: enabled timer and animation frame APIs run at the configured multiplier.

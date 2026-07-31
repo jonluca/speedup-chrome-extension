@@ -11,17 +11,34 @@ const extensionIcons = {
 };
 
 export default defineConfig({
+  manifestVersion: 3,
+  targetBrowsers: ["chrome", "edge", "firefox", "safari"],
   modules: ["@wxt-dev/module-react"],
   vite: () => ({
     plugins: [tailwindcss()],
   }),
-  manifest: {
+  manifest: ({ browser }) => ({
     name: "Speed Up Pages",
     description: "Speed up webpage timers and animation frames.",
+    version: "0.2.0",
     icons: extensionIcons,
     action: {
       default_icon: extensionIcons,
     },
     permissions: ["activeTab", "storage"],
-  },
+    ...(browser === "firefox"
+      ? {
+          browser_specific_settings: {
+            gecko: {
+              id: "speed-up-pages@jonlu.ca",
+              strict_min_version: "140.0",
+              data_collection_permissions: { required: ["none"] },
+            },
+            gecko_android: {
+              strict_min_version: "142.0",
+            },
+          },
+        }
+      : {}),
+  }),
 });

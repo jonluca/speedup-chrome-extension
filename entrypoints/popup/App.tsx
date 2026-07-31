@@ -154,7 +154,14 @@ export default function App() {
       return;
     }
 
-    await browser.sidePanel.open({ tabId: currentTabId });
+    if (browser.sidePanel?.open) {
+      await browser.sidePanel.open({ tabId: currentTabId });
+      return;
+    }
+
+    await browser.tabs.create({
+      url: browser.runtime.getURL("/sidepanel.html"),
+    });
   }
 
   async function selectMode(mode: SpeedMode) {

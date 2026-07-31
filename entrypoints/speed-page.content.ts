@@ -195,6 +195,9 @@ export default defineContentScript({
       }
 
       const [, rawUrl, line, column] = match;
+      if (!rawUrl || !line || !column) {
+        return location;
+      }
 
       try {
         const url = new URL(rawUrl);
@@ -221,7 +224,11 @@ export default defineContentScript({
         return undefined;
       }
 
-      const location = normalizeStackLocation(locationMatch[1]);
+      const rawStackLocation = locationMatch[1];
+      if (!rawStackLocation) {
+        return undefined;
+      }
+      const location = normalizeStackLocation(rawStackLocation);
       return isInternalStackLocation(location) ? undefined : location;
     }
 
@@ -381,10 +388,7 @@ export default defineContentScript({
     function invokeTimerHandler(handler: TimeoutHandler, args: TimerArgs): void {
       if (typeof handler === "function") {
         handler.apply(window, args);
-        return;
       }
-
-      (0, eval)(handler);
     }
 
     function completeTimerOccurrence(record: TimerRecord): void {
@@ -622,7 +626,7 @@ export default defineContentScript({
       delay?: number,
       ...args: TimerArgs
     ): number {
-      if (!shouldManageTimer("setTimeout")) {
+      if (typeof handler === "string" || !shouldManageTimer("setTimeout")) {
         return originalSetTimeout(handler, delay, ...args);
       }
 
@@ -671,7 +675,7 @@ export default defineContentScript({
       delay?: number,
       ...args: TimerArgs
     ): number {
-      if (!shouldManageTimer("setInterval")) {
+      if (typeof handler === "string" || !shouldManageTimer("setInterval")) {
         return originalSetInterval(handler, delay, ...args);
       }
 
